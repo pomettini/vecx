@@ -4,7 +4,7 @@
 #include "osint.h"
 #include "e8910.h"
 
-#define einline static __inline
+#define einline __inline
 
 unsigned char rom[8192];
 unsigned char cart[32768];
@@ -201,7 +201,7 @@ static einline void int_update (void)
 
 unsigned char read8 (unsigned address)
 {
-	unsigned char data;
+	unsigned char data = 0xff;
 
 	if ((address & 0xe000) == 0xe000) {
 		/* rom */

@@ -1,0 +1,5 @@
+name=vecx
+author=Pomettini & Valavan Manohararajah
+description=Vectrex emulator for Playdate
+bundleID=com.pomettini.vecx
+imagePath=
