@@ -1,4 +1,5 @@
 #include "e6809.h"
+#include "vecx.h"
 
 #define E6809_LOG(...) ((void)0)
 
@@ -68,16 +69,11 @@ static unsigned *rptr_xyus[4] = {
 	&reg_s
 };
 
-/* user defined read and write functions */
-
-unsigned char (*e6809_read8) (unsigned address);
-void (*e6809_write8) (unsigned address, unsigned char data);
-
 /* obtain a particular condition code. returns 0 or 1. */
 
 static einline unsigned get_cc (unsigned flag)
 {
-	return (reg_cc / flag) & 1;
+	return (reg_cc & flag) != 0;
 }
 
 /* set a particular condition code to either 0 or 1.
@@ -86,8 +82,11 @@ static einline unsigned get_cc (unsigned flag)
 
 static einline void set_cc (unsigned flag, unsigned value)
 {
-	reg_cc &= ~flag;
-	reg_cc |= value * flag;
+	if (value) {
+		reg_cc |= flag;
+	} else {
+		reg_cc &= ~flag;
+	}
 }
 
 /* test carry */
@@ -116,29 +115,14 @@ static einline unsigned test_n (unsigned r)
 
 static einline unsigned test_z8 (unsigned r)
 {
-	unsigned flag;
-
-	flag = ~r;
-	flag = (flag >> 4) & (flag & 0xf);
-	flag = (flag >> 2) & (flag & 0x3);
-	flag = (flag >> 1) & (flag & 0x1);
-
-	return flag;
+	return (r & 0xff) == 0;
 }
 
 /* test for zero in lower 16 bits */
 
 static einline unsigned test_z16 (unsigned r)
 {
-	unsigned flag;
-
-	flag = ~r;
-	flag = (flag >> 8) & (flag & 0xff);
-	flag = (flag >> 4) & (flag & 0xf);
-	flag = (flag >> 2) & (flag & 0x3);
-	flag = (flag >> 1) & (flag & 0x1);
-
-	return flag;
+	return (r & 0xffff) == 0;
 }
 
 /* overflow is set whenever the sign bits of the inputs are the same
@@ -174,7 +158,7 @@ static einline void set_reg_d (unsigned value)
 
 static einline unsigned read8 (unsigned address)
 {
-	return (*e6809_read8) (address & 0xffff);
+	return vecx_read8 (address & 0xffff);
 }
 
 /* write a byte ... only the lower 8-bits of the unsigned data
@@ -183,7 +167,7 @@ static einline unsigned read8 (unsigned address)
 
 static einline void write8 (unsigned address, unsigned data)
 {
-	(*e6809_write8) (address & 0xffff, (unsigned char) data);
+	vecx_write8 (address & 0xffff, (unsigned char) data);
 }
 
 static einline unsigned read16 (unsigned address)

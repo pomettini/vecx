@@ -7,7 +7,7 @@
 #include "osint.h"
 #include "vecx.h"
 
-#define TARGET_FPS 30U
+#define TARGET_FPS VECTREX_FRAME_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
 #define BENCHMARK_LOG_MS 5000U
 #define BUILD_LABEL __DATE__ " " __TIME__
@@ -25,6 +25,9 @@ static uint32_t bench_render_count;
 static uint32_t bench_skipped_frames;
 static uint32_t bench_total_update_ms;
 static uint32_t bench_total_render_ms;
+static uint32_t bench_total_vectors;
+static uint32_t bench_total_emu_cycles;
+static uint32_t bench_total_emu_instructions;
 static uint32_t bench_min_update_ms;
 static uint32_t bench_max_update_ms;
 
@@ -76,11 +79,18 @@ static void load_roms(void)
 	memset(cart, 0, sizeof(cart));
 
 	{
-		unsigned int cart_bytes = read_partial_file("cart.vec", cart, sizeof(cart));
+		const char* cart_name = "cart.vec";
+		unsigned int cart_bytes = read_partial_file(cart_name, cart, sizeof(cart));
+
+		if (cart_bytes == 0) {
+			cart_name = "mine_storm.vec";
+			cart_bytes = read_partial_file(cart_name, cart, sizeof(cart));
+		}
+
 		if (cart_bytes > 0) {
-			pd->system->logToConsole("vecx: loaded cart.vec (%u bytes)", cart_bytes);
+			pd->system->logToConsole("vecx: loaded %s (%u bytes)", cart_name, cart_bytes);
 		} else {
-			pd->system->logToConsole("vecx: no cart.vec found; using BIOS only");
+			pd->system->logToConsole("vecx: no cart.vec or mine_storm.vec found; using BIOS only");
 		}
 	}
 }
@@ -147,6 +157,9 @@ static void reset_benchmark(uint32_t now_ms)
 	bench_skipped_frames = 0;
 	bench_total_update_ms = 0;
 	bench_total_render_ms = 0;
+	bench_total_vectors = 0;
+	bench_total_emu_cycles = 0;
+	bench_total_emu_instructions = 0;
 	bench_min_update_ms = UINT32_MAX;
 	bench_max_update_ms = 0;
 }
@@ -157,6 +170,9 @@ static void maybe_log_benchmark(uint32_t now_ms)
 	unsigned long avg_fps_x100;
 	unsigned long avg_update_x100;
 	unsigned long avg_render_x100;
+	unsigned long avg_instructions_x100;
+	unsigned long avg_cycles_per_instruction_x100;
+	unsigned long avg_vectors_x100;
 
 	if (elapsed_ms < BENCHMARK_LOG_MS || bench_update_count == 0)
 		return;
@@ -166,9 +182,16 @@ static void maybe_log_benchmark(uint32_t now_ms)
 	avg_render_x100 = bench_render_count > 0
 		? (unsigned long)(((uint64_t)bench_total_render_ms * 100ULL) / bench_render_count)
 		: 0;
+	avg_instructions_x100 = (unsigned long)(((uint64_t)bench_total_emu_instructions * 100ULL) / bench_update_count);
+	avg_cycles_per_instruction_x100 = bench_total_emu_instructions > 0
+		? (unsigned long)(((uint64_t)bench_total_emu_cycles * 100ULL) / bench_total_emu_instructions)
+		: 0;
+	avg_vectors_x100 = bench_render_count > 0
+		? (unsigned long)(((uint64_t)bench_total_vectors * 100ULL) / bench_render_count)
+		: 0;
 
 	pd->system->logToConsole(
-		"vecx bench build=\"%s\" window_ms=%lu updates=%lu renders=%lu avg_fps=%lu.%02lu avg_update_ms=%lu.%02lu avg_render_ms=%lu.%02lu min_update_ms=%lu max_update_ms=%lu skipped=%lu",
+		"vecx bench build=\"%s\" window_ms=%lu updates=%lu renders=%lu avg_fps=%lu.%02lu avg_update_ms=%lu.%02lu avg_render_ms=%lu.%02lu min_update_ms=%lu max_update_ms=%lu emu_cycles=%lu emu_instr=%lu avg_instr_update=%lu.%02lu avg_cpi=%lu.%02lu avg_vectors=%lu.%02lu skipped=%lu",
 		BUILD_LABEL,
 		(unsigned long)elapsed_ms,
 		(unsigned long)bench_update_count,
@@ -181,6 +204,14 @@ static void maybe_log_benchmark(uint32_t now_ms)
 		avg_render_x100 % 100UL,
 		(unsigned long)bench_min_update_ms,
 		(unsigned long)bench_max_update_ms,
+		(unsigned long)bench_total_emu_cycles,
+		(unsigned long)bench_total_emu_instructions,
+		avg_instructions_x100 / 100UL,
+		avg_instructions_x100 % 100UL,
+		avg_cycles_per_instruction_x100 / 100UL,
+		avg_cycles_per_instruction_x100 % 100UL,
+		avg_vectors_x100 / 100UL,
+		avg_vectors_x100 % 100UL,
 		(unsigned long)bench_skipped_frames);
 
 	reset_benchmark(now_ms);
@@ -189,6 +220,7 @@ static void maybe_log_benchmark(uint32_t now_ms)
 void osint_render(void)
 {
 	uint32_t start_ms = pd->system->getCurrentTimeMilliseconds();
+	uint32_t drawn_vectors = 0;
 	long i;
 
 	pd->graphics->clear(kColorWhite);
@@ -209,11 +241,13 @@ void osint_render(void)
 		y1 = offset_y + (int)(v->y1 / scale_factor);
 
 		pd->graphics->drawLine(x0, y0, x1, y1, 1, kColorBlack);
+		drawn_vectors++;
 	}
 
 	pd->system->drawFPS(0, 0);
 
 	bench_render_count++;
+	bench_total_vectors += drawn_vectors;
 	bench_total_render_ms += pd->system->getCurrentTimeMilliseconds() - start_ms;
 }
 
@@ -229,6 +263,8 @@ static int update(void* userdata)
 
 	update_input();
 	vecx_emu(EMU_CYCLES_PER_UPDATE);
+	bench_total_emu_cycles += (uint32_t)vecx_emu_cycle_count;
+	bench_total_emu_instructions += (uint32_t)vecx_emu_instruction_count;
 
 	elapsed_ms = pd->system->getCurrentTimeMilliseconds() - start_ms;
 	bench_update_count++;
@@ -256,7 +292,8 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		screen_h = pd->display->getHeight();
 		update_scaling();
 
-		pd->display->setRefreshRate(30.0f);
+		pd->display->setRefreshRate((float)TARGET_FPS);
+		pd->display->setInverted(1);
 		pd->system->setAutoLockDisabled(1);
 
 		load_roms();

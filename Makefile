@@ -26,6 +26,10 @@ ULIBS =
 
 include $(SDK)/C_API/buildsupport/common.mk
 
+OPT = -O3 -falign-functions=16 -fomit-frame-pointer
+CPFLAGS += -flto
+LDFLAGS += -flto
+
 PLAYDATE_GAMES ?= /Volumes/PLAYDATE/Games
 
 .PHONY: install _push
@@ -33,6 +37,7 @@ PLAYDATE_GAMES ?= /Volumes/PLAYDATE/Games
 install: all
 	@test -d "$(PLAYDATE_GAMES)" || (echo "Playdate volume not mounted at $(PLAYDATE_GAMES)" && exit 1)
 	$(RM) -rf "$(PLAYDATE_GAMES)/$(PRODUCT)"
-	cp -R "$(PRODUCT)" "$(PLAYDATE_GAMES)/"
+	COPYFILE_DISABLE=1 cp -R "$(PRODUCT)" "$(PLAYDATE_GAMES)/"
+	-dot_clean -m "$(PLAYDATE_GAMES)/$(PRODUCT)"
 
 _push: install

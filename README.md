@@ -28,7 +28,7 @@ make _push
 Cartridges
 ----------
 
-The Vectrex BIOS is packaged as `Source/rom.dat`. If you want to test a local cartridge, add it as `Source/cart.vec` before building. `.vec` files are intentionally ignored by Git.
+The Vectrex BIOS is packaged as `Source/rom.dat`. If you want to test a local cartridge, add it as `Source/cart.vec` before building. The loader also falls back to `Source/mine_storm.vec` when present. `.vec` files are intentionally ignored by Git.
 
 Notes
 -----

@@ -5,6 +5,7 @@
 #include "e8910.h"
 
 #define einline __inline
+#define VECX_FAST_BATCH 1
 
 unsigned char rom[8192];
 unsigned char cart[32768];
@@ -63,7 +64,7 @@ static long alg_curr_x; /* current x position */
 static long alg_curr_y; /* current y position */
 
 enum {
-	VECTREX_PDECAY	= 30,      /* phosphor decay rate */
+	VECTREX_PDECAY	= VECTREX_FRAME_HZ, /* phosphor decay rate */
 
 	/* number of 6809 cycles before a frame redraw */
 
@@ -93,6 +94,8 @@ long vector_erse_cnt;
 static vector_t vectors_set[2 * VECTOR_CNT];
 vector_t *vectors_draw;
 vector_t *vectors_erse;
+unsigned long vecx_emu_cycle_count;
+unsigned long vecx_emu_instruction_count;
 
 static long vector_hash[VECTOR_HASH];
 
@@ -199,7 +202,7 @@ static einline void int_update (void)
 	}
 }
 
-unsigned char read8 (unsigned address)
+VECX_NOINLINE unsigned char vecx_read8 (unsigned address)
 {
 	unsigned char data = 0xff;
 
@@ -345,7 +348,7 @@ unsigned char read8 (unsigned address)
 	return data;
 }
 
-void write8 (unsigned address, unsigned char data)
+VECX_NOINLINE void vecx_write8 (unsigned address, unsigned char data)
 {
 	if ((address & 0xe000) == 0xe000) {
 		/* rom */
@@ -595,9 +598,6 @@ void vecx_reset (void)
 
 	fcycles = FCYCLES_INIT;
 
-	e6809_read8 = read8;
-	e6809_write8 = write8;
-
 	e6809_reset ();
 }
 
@@ -605,54 +605,9 @@ void vecx_reset (void)
  * via_sstep0 is the first postion of the emulation.
  */
 
-static einline void via_sstep0 (void)
+static einline void via_shift_sstep (void)
 {
 	unsigned t2shift;
-
-	if (via_t1on) {
-		via_t1c--;
-
-		if ((via_t1c & 0xffff) == 0xffff) {
-			/* counter just rolled over */
-
-			if (via_acr & 0x40) {
-				/* continuous interrupt mode */
-
-				via_ifr |= 0x40;
-				int_update ();
-				via_t1pb7 = 0x80 - via_t1pb7;
-
-				/* reload counter */
-
-				via_t1c = (via_t1lh << 8) | via_t1ll;
-			} else {
-				/* one shot mode */
-
-				if (via_t1int) {
-					via_ifr |= 0x40;
-					int_update ();
-					via_t1pb7 = 0x80;
-					via_t1int = 0;
-				}
-			}
-		}
-	}
-
-	if (via_t2on && (via_acr & 0x20) == 0x00) {
-		via_t2c--;
-
-		if ((via_t2c & 0xffff) == 0xffff) {
-			/* one shot mode */
-
-			if (via_t2int) {
-				via_ifr |= 0x20;
-				int_update ();
-				via_t2int = 0;
-			}
-		}
-	}
-
-	/* shift counter */
 
 	via_src--;
 
@@ -741,6 +696,54 @@ static einline void via_sstep0 (void)
 	}
 }
 
+static einline void via_sstep0 (void)
+{
+	if (via_t1on) {
+		via_t1c--;
+
+		if ((via_t1c & 0xffff) == 0xffff) {
+			/* counter just rolled over */
+
+			if (via_acr & 0x40) {
+				/* continuous interrupt mode */
+
+				via_ifr |= 0x40;
+				int_update ();
+				via_t1pb7 = 0x80 - via_t1pb7;
+
+				/* reload counter */
+
+				via_t1c = (via_t1lh << 8) | via_t1ll;
+			} else {
+				/* one shot mode */
+
+				if (via_t1int) {
+					via_ifr |= 0x40;
+					int_update ();
+					via_t1pb7 = 0x80;
+					via_t1int = 0;
+				}
+			}
+		}
+	}
+
+	if (via_t2on && (via_acr & 0x20) == 0x00) {
+		via_t2c--;
+
+		if ((via_t2c & 0xffff) == 0xffff) {
+			/* one shot mode */
+
+			if (via_t2int) {
+				via_ifr |= 0x20;
+				int_update ();
+				via_t2int = 0;
+			}
+		}
+	}
+
+	via_shift_sstep ();
+}
+
 /* perform the second part of the via emulation */
 
 static einline void via_sstep1 (void)
@@ -759,6 +762,63 @@ static einline void via_sstep1 (void)
 		 */
 
 		via_cb2h = 1;
+	}
+}
+
+static einline void via_sstep0_batch (unsigned cycles)
+{
+	unsigned shift_cycles;
+
+	if (via_t1on) {
+		unsigned remaining = cycles;
+
+		while (remaining > 0) {
+			unsigned step = (via_t1c & 0xffff) + 1;
+
+			if (remaining < step) {
+				via_t1c -= remaining;
+				break;
+			}
+
+			remaining -= step;
+
+			if (via_acr & 0x40) {
+				via_ifr |= 0x40;
+				int_update ();
+				via_t1pb7 = 0x80 - via_t1pb7;
+				via_t1c = (via_t1lh << 8) | via_t1ll;
+			} else {
+				via_t1c -= step;
+				if (via_t1int) {
+					via_ifr |= 0x40;
+					int_update ();
+					via_t1pb7 = 0x80;
+					via_t1int = 0;
+				}
+
+				if (remaining > 0) {
+					via_t1c -= remaining;
+					break;
+				}
+			}
+		}
+	}
+
+	if (via_t2on && (via_acr & 0x20) == 0x00) {
+		unsigned step = (via_t2c & 0xffff) + 1;
+
+		via_t2c -= cycles;
+
+		if (cycles >= step && via_t2int) {
+			via_ifr |= 0x20;
+			int_update ();
+			via_t2int = 0;
+		}
+	}
+
+	shift_cycles = cycles;
+	while (shift_cycles-- > 0 && via_srb < 8) {
+		via_shift_sstep ();
 	}
 }
 
@@ -921,18 +981,119 @@ static einline void alg_sstep (void)
 	}
 }
 
+static einline void alg_sstep_batch (unsigned cycles)
+{
+	long sig_dx, sig_dy;
+	unsigned sig_ramp;
+	unsigned sig_blank;
+	unsigned move_cycles = cycles;
+
+	if (cycles == 0) {
+		return;
+	}
+
+	if ((via_acr & 0x10) == 0x10) {
+		sig_blank = via_cb2s;
+	} else {
+		sig_blank = via_cb2h;
+	}
+
+	if (via_ca2 == 0) {
+		sig_dx = ALG_MAX_X / 2 - alg_curr_x;
+		sig_dy = ALG_MAX_Y / 2 - alg_curr_y;
+		move_cycles = 1;
+	} else {
+		if (via_acr & 0x80) {
+			sig_ramp = via_t1pb7;
+		} else {
+			sig_ramp = via_orb & 0x80;
+		}
+
+		if (sig_ramp == 0) {
+			sig_dx = alg_dx;
+			sig_dy = alg_dy;
+		} else {
+			sig_dx = 0;
+			sig_dy = 0;
+		}
+	}
+
+	if (alg_vectoring == 0) {
+		if (sig_blank == 1 &&
+			alg_curr_x >= 0 && alg_curr_x < ALG_MAX_X &&
+			alg_curr_y >= 0 && alg_curr_y < ALG_MAX_Y) {
+			alg_vectoring = 1;
+			alg_vector_x0 = alg_curr_x;
+			alg_vector_y0 = alg_curr_y;
+			alg_vector_x1 = alg_curr_x;
+			alg_vector_y1 = alg_curr_y;
+			alg_vector_dx = sig_dx;
+			alg_vector_dy = sig_dy;
+			alg_vector_color = (unsigned char) alg_zsh;
+		}
+	} else {
+		if (sig_blank == 0) {
+			alg_vectoring = 0;
+			alg_addline (alg_vector_x0, alg_vector_y0,
+						 alg_vector_x1, alg_vector_y1,
+						 alg_vector_color);
+		} else if (sig_dx != alg_vector_dx ||
+				   sig_dy != alg_vector_dy ||
+				   (unsigned char) alg_zsh != alg_vector_color) {
+			alg_addline (alg_vector_x0, alg_vector_y0,
+						 alg_vector_x1, alg_vector_y1,
+						 alg_vector_color);
+
+			if (alg_curr_x >= 0 && alg_curr_x < ALG_MAX_X &&
+				alg_curr_y >= 0 && alg_curr_y < ALG_MAX_Y) {
+				alg_vector_x0 = alg_curr_x;
+				alg_vector_y0 = alg_curr_y;
+				alg_vector_x1 = alg_curr_x;
+				alg_vector_y1 = alg_curr_y;
+				alg_vector_dx = sig_dx;
+				alg_vector_dy = sig_dy;
+				alg_vector_color = (unsigned char) alg_zsh;
+			} else {
+				alg_vectoring = 0;
+			}
+		}
+	}
+
+	alg_curr_x += sig_dx * (long) move_cycles;
+	alg_curr_y += sig_dy * (long) move_cycles;
+
+	if (alg_vectoring == 1 &&
+		alg_curr_x >= 0 && alg_curr_x < ALG_MAX_X &&
+		alg_curr_y >= 0 && alg_curr_y < ALG_MAX_Y) {
+		alg_vector_x1 = alg_curr_x;
+		alg_vector_y1 = alg_curr_y;
+	}
+}
+
 void vecx_emu (long cycles)
 {
 	unsigned c, icycles;
+	unsigned long cycle_count = 0;
+	unsigned long instruction_count = 0;
 
 	while (cycles > 0) {
 		icycles = e6809_sstep (via_ifr & 0x80, 0);
+		instruction_count++;
+		cycle_count += icycles;
 
+#if VECX_FAST_BATCH
+		if (icycles > 0) {
+			via_sstep0_batch (icycles);
+			alg_sstep_batch (icycles);
+			via_sstep1 ();
+		}
+#else
 		for (c = 0; c < icycles; c++) {
 			via_sstep0 ();
 			alg_sstep ();
 			via_sstep1 ();
 		}
+#endif
 
 		cycles -= (long) icycles;
 
@@ -956,4 +1117,7 @@ void vecx_emu (long cycles)
 			vectors_draw = tmp;
 		}
 	}
+
+	vecx_emu_cycle_count = cycle_count;
+	vecx_emu_instruction_count = instruction_count;
 }

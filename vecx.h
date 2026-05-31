@@ -1,8 +1,15 @@
 #ifndef __VECX_H
 #define __VECX_H
 
+#if defined(__GNUC__)
+#define VECX_NOINLINE __attribute__((noinline))
+#else
+#define VECX_NOINLINE
+#endif
+
 enum {
 	VECTREX_MHZ		= 1500000, /* speed of the vectrex being emulated */
+	VECTREX_FRAME_HZ = 60,
 	VECTREX_COLORS  = 128,     /* number of possible colors ... grayscale */
 
 	ALG_MAX_X		= 33000,
@@ -32,7 +39,11 @@ extern long vector_draw_cnt;
 extern long vector_erse_cnt;
 extern vector_t *vectors_draw;
 extern vector_t *vectors_erse;
+extern unsigned long vecx_emu_cycle_count;
+extern unsigned long vecx_emu_instruction_count;
 
+VECX_NOINLINE unsigned char vecx_read8 (unsigned address);
+VECX_NOINLINE void vecx_write8 (unsigned address, unsigned char data);
 void vecx_reset (void);
 void vecx_emu (long cycles);
 
