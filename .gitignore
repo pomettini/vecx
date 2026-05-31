@@ -1,3 +1,19 @@
 *.o
 vecx
 tags
+
+# Playdate build output
+build/
+*.pdx/
+Source/pdex.bin
+Source/pdex.dylib
+Source/pdex.dll
+Source/pdex.elf
+Source/pdex.so
+
+# Local ROM/cart files
+*.vec
+
+# AI assistant files
+.claude/
+.codex/
