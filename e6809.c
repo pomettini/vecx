@@ -73,7 +73,7 @@ static unsigned *rptr_xyus[4] = {
 
 static einline unsigned get_cc (unsigned flag)
 {
-	return (reg_cc & flag) != 0;
+	return (reg_cc / flag) & 1;
 }
 
 /* set a particular condition code to either 0 or 1.
@@ -82,11 +82,8 @@ static einline unsigned get_cc (unsigned flag)
 
 static einline void set_cc (unsigned flag, unsigned value)
 {
-	if (value) {
-		reg_cc |= flag;
-	} else {
-		reg_cc &= ~flag;
-	}
+	reg_cc &= ~flag;
+	reg_cc |= value * flag;
 }
 
 /* test carry */
@@ -115,14 +112,29 @@ static einline unsigned test_n (unsigned r)
 
 static einline unsigned test_z8 (unsigned r)
 {
-	return (r & 0xff) == 0;
+	unsigned flag;
+
+	flag = ~r;
+	flag = (flag >> 4) & (flag & 0xf);
+	flag = (flag >> 2) & (flag & 0x3);
+	flag = (flag >> 1) & (flag & 0x1);
+
+	return flag;
 }
 
 /* test for zero in lower 16 bits */
 
 static einline unsigned test_z16 (unsigned r)
 {
-	return (r & 0xffff) == 0;
+	unsigned flag;
+
+	flag = ~r;
+	flag = (flag >> 8) & (flag & 0xff);
+	flag = (flag >> 4) & (flag & 0xf);
+	flag = (flag >> 2) & (flag & 0x3);
+	flag = (flag >> 1) & (flag & 0x1);
+
+	return flag;
 }
 
 /* overflow is set whenever the sign bits of the inputs are the same
@@ -1102,6 +1114,21 @@ void e6809_reset (void)
 	irq_status = IRQ_NORMAL;
 
 	reg_pc = read16 (0xfffe);
+}
+
+unsigned e6809_get_pc (void)
+{
+	return reg_pc & 0xffff;
+}
+
+unsigned e6809_get_a (void)
+{
+	return reg_a & 0xff;
+}
+
+unsigned e6809_get_dp (void)
+{
+	return reg_dp & 0xff;
 }
 
 /* execute a single instruction or handle interrupts and return */
