@@ -14,6 +14,16 @@
 
 #define einline __inline
 
+#define E6809_COLD_PAGE_SPLIT 0
+
+#if E6809_COLD_PAGE_SPLIT && defined(__GNUC__)
+#define e_cold_ninline __attribute__((noinline, cold))
+#elif defined(__GNUC__)
+#define e_cold_ninline __inline __attribute__((always_inline))
+#else
+#define e_cold_ninline __inline
+#endif
+
 enum {
 	FLAG_E		= 0x80,
 	FLAG_F		= 0x40,
@@ -1129,6 +1139,302 @@ unsigned e6809_get_a (void)
 unsigned e6809_get_dp (void)
 {
 	return reg_dp & 0xff;
+}
+
+unsigned e6809_skip_bios_delay_f4eb (unsigned max_cycles)
+{
+	unsigned iterations;
+	unsigned cycles;
+
+	if (max_cycles == 0 || reg_pc != 0xf4eb) {
+		return 0;
+	}
+
+	if (read8 (0xf4eb) != 0x86 ||
+		read8 (0xf4ec) != 0x81 ||
+		read8 (0xf4ed) != 0x12 ||
+		read8 (0xf4ee) != 0x5a ||
+		read8 (0xf4ef) != 0x26 ||
+		read8 (0xf4f0) != 0xfa) {
+		return 0;
+	}
+
+	iterations = reg_b & 0xff;
+	if (iterations == 0) {
+		iterations = 0x100;
+	}
+
+	cycles = iterations * 9;
+	if (cycles > max_cycles) {
+		return 0;
+	}
+
+	reg_a = 0x81;
+	reg_b = 0;
+	reg_pc = 0xf4f1;
+	reg_cc &= ~(FLAG_N | FLAG_V);
+	reg_cc |= FLAG_Z;
+
+	return cycles;
+}
+
+static e_cold_ninline unsigned e6809_sstep_page1 (void)
+{
+	unsigned op = pc_read8 ();
+	unsigned cycles = 0;
+	unsigned ea;
+
+	switch (op) {
+	/* lbra */
+	case 0x20:
+	/* lbrn */
+	case 0x21:
+		inst_bra16 (0, op, &cycles);
+		break;
+	/* lbhi */
+	case 0x22:
+	/* lbls */
+	case 0x23:
+		inst_bra16 (get_cc (FLAG_C) | get_cc (FLAG_Z), op, &cycles);
+		break;
+	/* lbhs/lbcc */
+	case 0x24:
+	/* lblo/lbcs */
+	case 0x25:
+		inst_bra16 (get_cc (FLAG_C), op, &cycles);
+		break;
+	/* lbne */
+	case 0x26:
+	/* lbeq */
+	case 0x27:
+		inst_bra16 (get_cc (FLAG_Z), op, &cycles);
+		break;
+	/* lbvc */
+	case 0x28:
+	/* lbvs */
+	case 0x29:
+		inst_bra16 (get_cc (FLAG_V), op, &cycles);
+		break;
+	/* lbpl */
+	case 0x2a:
+	/* lbmi */
+	case 0x2b:
+		inst_bra16 (get_cc (FLAG_N), op, &cycles);
+		break;
+	/* lbge */
+	case 0x2c:
+	/* lblt */
+	case 0x2d:
+		inst_bra16 (get_cc (FLAG_N) ^ get_cc (FLAG_V), op, &cycles);
+		break;
+	/* lbgt */
+	case 0x2e:
+	/* lble */
+	case 0x2f:
+		inst_bra16 (get_cc (FLAG_Z) |
+					(get_cc (FLAG_N) ^ get_cc (FLAG_V)), op, &cycles);
+		break;
+	/* cmpd */
+	case 0x83:
+		inst_sub16 (get_reg_d (), pc_read16 ());
+		cycles += 5;
+		break;
+	case 0x93:
+		ea = ea_direct ();
+		inst_sub16 (get_reg_d (), read16 (ea));
+		cycles += 7;
+		break;
+	case 0xa3:
+		ea = ea_indexed (&cycles);
+		inst_sub16 (get_reg_d (), read16 (ea));
+		cycles += 7;
+		break;
+	case 0xb3:
+		ea = ea_extended ();
+		inst_sub16 (get_reg_d (), read16 (ea));
+		cycles += 8;
+		break;
+	/* cmpy */
+	case 0x8c:
+		inst_sub16 (reg_y, pc_read16 ());
+		cycles += 5;
+		break;
+	case 0x9c:
+		ea = ea_direct ();
+		inst_sub16 (reg_y, read16 (ea));
+		cycles += 7;
+		break;
+	case 0xac:
+		ea = ea_indexed (&cycles);
+		inst_sub16 (reg_y, read16 (ea));
+		cycles += 7;
+		break;
+	case 0xbc:
+		ea = ea_extended ();
+		inst_sub16 (reg_y, read16 (ea));
+		cycles += 8;
+		break;
+	/* ldy */
+	case 0x8e:
+		reg_y = pc_read16 ();
+		inst_tst16 (reg_y);
+		cycles += 4;
+		break;
+	case 0x9e:
+		ea = ea_direct ();
+		reg_y = read16 (ea);
+		inst_tst16 (reg_y);
+		cycles += 6;
+		break;
+	case 0xae:
+		ea = ea_indexed (&cycles);
+		reg_y = read16 (ea);
+		inst_tst16 (reg_y);
+		cycles += 6;
+		break;
+	case 0xbe:
+		ea = ea_extended ();
+		reg_y = read16 (ea);
+		inst_tst16 (reg_y);
+		cycles += 7;
+		break;
+	/* sty */
+	case 0x9f:
+		ea = ea_direct ();
+		write16 (ea, reg_y);
+		inst_tst16 (reg_y);
+		cycles += 6;
+		break;
+	case 0xaf:
+		ea = ea_indexed (&cycles);
+		write16 (ea, reg_y);
+		inst_tst16 (reg_y);
+		cycles += 6;
+		break;
+	case 0xbf:
+		ea = ea_extended ();
+		write16 (ea, reg_y);
+		inst_tst16 (reg_y);
+		cycles += 7;
+		break;
+	/* lds */
+	case 0xce:
+		reg_s = pc_read16 ();
+		inst_tst16 (reg_s);
+		cycles += 4;
+		break;
+	case 0xde:
+		ea = ea_direct ();
+		reg_s = read16 (ea);
+		inst_tst16 (reg_s);
+		cycles += 6;
+		break;
+	case 0xee:
+		ea = ea_indexed (&cycles);
+		reg_s = read16 (ea);
+		inst_tst16 (reg_s);
+		cycles += 6;
+		break;
+	case 0xfe:
+		ea = ea_extended ();
+		reg_s = read16 (ea);
+		inst_tst16 (reg_s);
+		cycles += 7;
+		break;
+	/* sts */
+	case 0xdf:
+		ea = ea_direct ();
+		write16 (ea, reg_s);
+		inst_tst16 (reg_s);
+		cycles += 6;
+		break;
+	case 0xef:
+		ea = ea_indexed (&cycles);
+		write16 (ea, reg_s);
+		inst_tst16 (reg_s);
+		cycles += 6;
+		break;
+	case 0xff:
+		ea = ea_extended ();
+		write16 (ea, reg_s);
+		inst_tst16 (reg_s);
+		cycles += 7;
+		break;
+	/* swi2 */
+	case 0x3f:
+		set_cc (FLAG_E, 1);
+		inst_psh (0xff, &reg_s, reg_u, &cycles);
+		reg_pc = read16 (0xfff4);
+		cycles += 8;
+		break;
+	default:
+		E6809_LOG ("unknown page-1 op code: %.2x\n", op);
+		break;
+	}
+
+	return cycles;
+}
+
+static e_cold_ninline unsigned e6809_sstep_page2 (void)
+{
+	unsigned op = pc_read8 ();
+	unsigned cycles = 0;
+	unsigned ea;
+
+	switch (op) {
+	/* cmpu */
+	case 0x83:
+		inst_sub16 (reg_u, pc_read16 ());
+		cycles += 5;
+		break;
+	case 0x93:
+		ea = ea_direct ();
+		inst_sub16 (reg_u, read16 (ea));
+		cycles += 7;
+		break;
+	case 0xa3:
+		ea = ea_indexed (&cycles);
+		inst_sub16 (reg_u, read16 (ea));
+		cycles += 7;
+		break;
+	case 0xb3:
+		ea = ea_extended ();
+		inst_sub16 (reg_u, read16 (ea));
+		cycles += 8;
+		break;
+	/* cmps */
+	case 0x8c:
+		inst_sub16 (reg_s, pc_read16 ());
+		cycles += 5;
+		break;
+	case 0x9c:
+		ea = ea_direct ();
+		inst_sub16 (reg_s, read16 (ea));
+		cycles += 7;
+		break;
+	case 0xac:
+		ea = ea_indexed (&cycles);
+		inst_sub16 (reg_s, read16 (ea));
+		cycles += 7;
+		break;
+	case 0xbc:
+		ea = ea_extended ();
+		inst_sub16 (reg_s, read16 (ea));
+		cycles += 8;
+		break;
+	/* swi3 */
+	case 0x3f:
+		set_cc (FLAG_E, 1);
+		inst_psh (0xff, &reg_s, reg_u, &cycles);
+		reg_pc = read16 (0xfff2);
+		cycles += 8;
+		break;
+	default:
+		E6809_LOG ("unknown page-2 op code: %.2x\n", op);
+		break;
+	}
+
+	return cycles;
 }
 
 /* execute a single instruction or handle interrupts and return */

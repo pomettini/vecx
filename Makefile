@@ -26,7 +26,7 @@ ULIBS =
 
 include $(SDK)/C_API/buildsupport/common.mk
 
-OPT = -O3 -falign-functions=16 -fomit-frame-pointer
+OPT = -O3 -falign-functions=32 -fomit-frame-pointer
 CPFLAGS += -flto
 LDFLAGS += -flto
 

@@ -14,6 +14,8 @@ enum {
 	VECTREX_VECTOR_CAP = 768,
 	VECTREX_VECTOR_HASH = 1021,
 	VECTREX_COLORS  = 128,     /* number of possible colors ... grayscale */
+	VECX_SAMPLE_OPCODES = 256,
+	VECX_SAMPLE_PC_SLOTS = 32,
 
 	ALG_MAX_X		= 33000,
 	ALG_MAX_Y		= 41000
@@ -46,10 +48,17 @@ extern unsigned long vecx_emu_cycle_count;
 extern unsigned long vecx_emu_instruction_count;
 extern unsigned long vecx_wait_skip_count;
 extern unsigned long vecx_wait_skip_cycles;
+extern unsigned long vecx_delay_skip_count;
+extern unsigned long vecx_delay_skip_cycles;
+extern unsigned long vecx_sample_total;
+extern unsigned long vecx_sample_opcode_counts[VECX_SAMPLE_OPCODES];
+extern unsigned vecx_sample_pc_addr[VECX_SAMPLE_PC_SLOTS];
+extern unsigned long vecx_sample_pc_count[VECX_SAMPLE_PC_SLOTS];
 
 VECX_NOINLINE unsigned char vecx_read8 (unsigned address);
 VECX_NOINLINE void vecx_write8 (unsigned address, unsigned char data);
 void vecx_reset (void);
 void vecx_emu (long cycles);
+void vecx_sample_reset (void);
 
 #endif

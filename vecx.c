@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <string.h>
 #include <stdio.h>
 #include "e6809.h"
 #include "vecx.h"
@@ -7,7 +8,11 @@
 
 #define einline __inline
 #define VECX_FAST_BATCH 1
+#define VECX_MACHINE_ADVANCE_BATCH 1
 #define VECX_WAIT_LOOP_SKIP 1
+#define VECX_BIOS_DELAY_SKIP 0
+#define VECX_SAMPLE_PROFILE 0
+#define VECX_SAMPLE_INTERVAL 64
 
 unsigned char rom[8192];
 unsigned char cart[32768];
@@ -100,10 +105,58 @@ unsigned long vecx_emu_cycle_count;
 unsigned long vecx_emu_instruction_count;
 unsigned long vecx_wait_skip_count;
 unsigned long vecx_wait_skip_cycles;
+unsigned long vecx_delay_skip_count;
+unsigned long vecx_delay_skip_cycles;
+unsigned long vecx_sample_total;
+unsigned long vecx_sample_opcode_counts[VECX_SAMPLE_OPCODES];
+unsigned vecx_sample_pc_addr[VECX_SAMPLE_PC_SLOTS];
+unsigned long vecx_sample_pc_count[VECX_SAMPLE_PC_SLOTS];
 
 static int16_t vector_hash[VECTOR_HASH];
 
 static long fcycles;
+
+static einline unsigned vecx_peek8 (unsigned address);
+
+void vecx_sample_reset (void)
+{
+	vecx_sample_total = 0;
+	memset (vecx_sample_opcode_counts, 0, sizeof (vecx_sample_opcode_counts));
+	memset (vecx_sample_pc_addr, 0, sizeof (vecx_sample_pc_addr));
+	memset (vecx_sample_pc_count, 0, sizeof (vecx_sample_pc_count));
+}
+
+static einline void vecx_sample_record (unsigned pc)
+{
+	unsigned opcode = vecx_peek8 (pc);
+	unsigned min_slot = 0;
+	unsigned long min_count = vecx_sample_pc_count[0];
+	unsigned slot;
+
+	vecx_sample_total++;
+	vecx_sample_opcode_counts[opcode & 0xff]++;
+
+	for (slot = 0; slot < VECX_SAMPLE_PC_SLOTS; slot++) {
+		if (vecx_sample_pc_count[slot] == 0) {
+			vecx_sample_pc_addr[slot] = pc & 0xffff;
+			vecx_sample_pc_count[slot] = 1;
+			return;
+		}
+
+		if (vecx_sample_pc_addr[slot] == (pc & 0xffff)) {
+			vecx_sample_pc_count[slot]++;
+			return;
+		}
+
+		if (vecx_sample_pc_count[slot] < min_count) {
+			min_count = vecx_sample_pc_count[slot];
+			min_slot = slot;
+		}
+	}
+
+	vecx_sample_pc_addr[min_slot] = pc & 0xffff;
+	vecx_sample_pc_count[min_slot] = 1;
+}
 
 /* update the snd chips internal registers when via_ora/via_orb changes */
 
@@ -1163,7 +1216,7 @@ static einline void vecx_machine_advance (unsigned cycles)
 	}
 }
 
-#if VECX_WAIT_LOOP_SKIP
+#if VECX_WAIT_LOOP_SKIP || VECX_BIOS_DELAY_SKIP
 static einline void vecx_add_wait_candidate (unsigned *best, unsigned cycles)
 {
 	if (cycles == 0) {
@@ -1201,7 +1254,9 @@ static einline unsigned vecx_cycles_until_ifr_mask (unsigned poll_mask)
 
 	return best;
 }
+#endif
 
+#if VECX_WAIT_LOOP_SKIP
 static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles)
 {
 	unsigned pc;
@@ -1246,6 +1301,36 @@ static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles)
 }
 #endif
 
+#if VECX_BIOS_DELAY_SKIP
+static einline unsigned vecx_try_skip_bios_delay (long remaining_cycles)
+{
+	unsigned limit;
+
+	if (remaining_cycles <= 0 || e6809_get_pc () != 0xf4eb) {
+		return 0;
+	}
+
+	if ((via_ifr & 0x80) != 0) {
+		return 0;
+	}
+
+	if ((via_ier & 0x04) != 0 && via_srb < 8) {
+		return 0;
+	}
+
+	limit = (unsigned) remaining_cycles;
+	{
+		unsigned irq_cycles = vecx_cycles_until_ifr_mask (0x80);
+		if (irq_cycles != 0 && irq_cycles <= limit) {
+			limit = irq_cycles - 1;
+		}
+	}
+
+	return e6809_skip_bios_delay_f4eb (limit);
+}
+
+#endif
+
 void vecx_emu (long cycles)
 {
 	unsigned icycles;
@@ -1253,10 +1338,24 @@ void vecx_emu (long cycles)
 	unsigned long instruction_count = 0;
 	unsigned long wait_skip_count = 0;
 	unsigned long wait_skip_cycles = 0;
+	unsigned long delay_skip_count = 0;
+	unsigned long delay_skip_cycles = 0;
+#if VECX_MACHINE_ADVANCE_BATCH > 1
+	unsigned pending_cycles = 0;
+	unsigned pending_instructions = 0;
+#endif
 
 	while (cycles > 0) {
 #if VECX_WAIT_LOOP_SKIP
-		unsigned skip_cycles = vecx_try_skip_ifr_wait (cycles);
+		unsigned skip_cycles = 0;
+
+#if VECX_MACHINE_ADVANCE_BATCH > 1
+		if (pending_cycles == 0) {
+			skip_cycles = vecx_try_skip_ifr_wait (cycles);
+		}
+#else
+		skip_cycles = vecx_try_skip_ifr_wait (cycles);
+#endif
 
 		if (skip_cycles > 0) {
 			vecx_machine_advance (skip_cycles);
@@ -1268,16 +1367,55 @@ void vecx_emu (long cycles)
 		}
 #endif
 
+#if VECX_BIOS_DELAY_SKIP
+		{
+			unsigned delay_cycles = vecx_try_skip_bios_delay (cycles);
+
+			if (delay_cycles > 0) {
+				vecx_machine_advance (delay_cycles);
+				cycle_count += delay_cycles;
+				delay_skip_cycles += delay_cycles;
+				delay_skip_count++;
+				cycles -= (long) delay_cycles;
+				continue;
+			}
+		}
+#endif
+
+#if VECX_SAMPLE_PROFILE
+		if ((instruction_count & (VECX_SAMPLE_INTERVAL - 1U)) == 0) {
+			vecx_sample_record (e6809_get_pc ());
+		}
+#endif
+
 		icycles = e6809_sstep (via_ifr & 0x80, 0);
 		instruction_count++;
 		cycle_count += icycles;
 
+#if VECX_MACHINE_ADVANCE_BATCH > 1
+		pending_cycles += icycles;
+		pending_instructions++;
+		if (pending_instructions >= VECX_MACHINE_ADVANCE_BATCH || cycles <= (long) icycles) {
+			vecx_machine_advance (pending_cycles);
+			pending_cycles = 0;
+			pending_instructions = 0;
+		}
+#else
 		vecx_machine_advance (icycles);
+#endif
 		cycles -= (long) icycles;
 	}
+
+#if VECX_MACHINE_ADVANCE_BATCH > 1
+	if (pending_cycles > 0) {
+		vecx_machine_advance (pending_cycles);
+	}
+#endif
 
 	vecx_emu_cycle_count = cycle_count;
 	vecx_emu_instruction_count = instruction_count;
 	vecx_wait_skip_count = wait_skip_count;
 	vecx_wait_skip_cycles = wait_skip_cycles;
+	vecx_delay_skip_count = delay_skip_count;
+	vecx_delay_skip_cycles = delay_skip_cycles;
 }
