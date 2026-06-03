@@ -14,6 +14,15 @@
 
 #define einline __inline
 
+/* build 71: compact hot-opcode core. the most frequently executed opcodes are
+ * handled in a small prelude that returns before the ~19KB main switch is ever
+ * fetched, so the common path stays resident in the 16KB I-cache. the device
+ * microbench (build 70) showed a cache miss costs ~265 cycles and the
+ * interpreter takes ~2000 cyc/instr (~7-8 misses), so eliminating I-cache
+ * misses on the hot handlers is the lever. set to 0 to restore the baseline.
+ */
+#define E6809_HOT_CORE 0
+
 #define E6809_COLD_PAGE_SPLIT 0
 
 #if E6809_COLD_PAGE_SPLIT && defined(__GNUC__)
@@ -1489,6 +1498,50 @@ unsigned e6809_sstep (unsigned irq_i, unsigned irq_f)
 	}
 
 	op = pc_read8 ();
+
+#if E6809_HOT_CORE
+	/* compact hot-opcode core: handlers are exact copies of their main-switch
+	 * cases and return before the large switch below is fetched, keeping the
+	 * common path I-cache-resident. cold opcodes fall through to the full
+	 * decoder. (0xa6 lda-indexed is intentionally excluded: it needs the large
+	 * ea_indexed() switch, which would pull the cold footprint back in.)
+	 */
+	switch (op) {
+	case 0x12: /* nop */
+		cycles += 2;
+		return cycles;
+	case 0x20: case 0x21: /* bra, brn */
+		inst_bra8 (0, op, &cycles);
+		return cycles;
+	case 0x26: case 0x27: /* bne, beq */
+		inst_bra8 (get_cc (FLAG_Z), op, &cycles);
+		return cycles;
+	case 0x86: /* lda immediate */
+		reg_a = pc_read8 ();
+		inst_tst8 (reg_a);
+		cycles += 2;
+		return cycles;
+	case 0x95: /* bita direct */
+		ea = ea_direct ();
+		inst_and (reg_a, read8 (ea));
+		cycles += 4;
+		return cycles;
+	case 0x96: /* lda direct */
+		ea = ea_direct ();
+		reg_a = read8 (ea);
+		inst_tst8 (reg_a);
+		cycles += 4;
+		return cycles;
+	case 0x97: /* sta direct */
+		ea = ea_direct ();
+		write8 (ea, reg_a);
+		inst_tst8 (reg_a);
+		cycles += 4;
+		return cycles;
+	default:
+		break;
+	}
+#endif
 
 	switch (op) {
 	/* page 0 instructions */
