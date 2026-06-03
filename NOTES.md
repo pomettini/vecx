@@ -235,3 +235,49 @@
   - direct framebuffer writes and dirty-row marking instead of high-level draw calls when rendering becomes relevant,
   - dynamic frame pacing/interlace/frame-skip style options that keep emulation speed separate from display refresh where possible.
 - The most promising vecx transfer is a small Playdate-specific 6809 memory/fetch layer plus linker/section placement. Rendering tricks are lower priority because current render time is only about 1-1.5 ms.
+
+## Native-Speed Performance Assessment
+
+### Goal
+
+Reach native Vectrex emulation speed: 1,500,000 emulated 6809 cycles/sec, displayed at the Vectrex's ~50 Hz refresh with correct vector/beam character.
+
+### Where the port actually is
+
+- Baseline (build 62): about 410k emulated cycles/sec, and the wait-loop skip already "cheats" about 120k of those.
+- That is roughly 27% of native, a 3.5-4.5x gap (consistent with the Next Steps section above).
+- Builds 8-64 show that micro-tuning has plateaued: the last ~20 builds mostly oscillate around 26-33 FPS through cadence tradeoffs and small fast-paths, with frequent regressions.
+
+### The hardware reality that frames everything
+
+The Playdate is a 180 MHz Cortex-M7 (STM32F746), and the `.pdx` runs from external RAM through a 16 KB instruction cache. `e6809_sstep` alone is about 20 KB (see build 31), so the hot interpreter does not fit in I-cache.
+
+This single fact explains the whole build history:
+
+- `-Os` shrank the binary but ran slower (worse codegen on an already cache-bound loop).
+- `-falign-functions=32` was a real 8-10% win (instruction-cache line behavior).
+- Per-opcode fast paths (builds 12, 16, 18, 53) regressed: they added hot code, evicting more from the cache than they saved.
+
+This is no longer a tuning problem. The remaining wins are structural.
+
+### Honest verdict
+
+- True, continuous 1.5 MHz emulated throughput: unlikely with a portable switch-interpreter on this hardware. The budget is about 120 host cycles per Vectrex cycle; the port currently spends about 440.
+- "Feels native" (stable 50 Hz display, correct beam character, smooth Mine Storm): achievable, using structural changes plus the frameskip / wait-skip cheats already in place.
+- Realistic landing zone with the plan below: about 60-90% of native throughput, which combined with render decoupling is enough to look right.
+
+### The three structural levers (in ROI order)
+
+1. Replace the memory dispatch with a page-pointer table - biggest single win. Every byte fetch currently goes `pc_read8` -> `read8` -> `vecx_read8` (`vecx.c:549`), and `vecx_read8` / `vecx_write8` are `VECX_NOINLINE` with a 5-way address branch ladder. A typical instruction does 2-4 of these, a non-inlined call plus serial branch decode per byte. The fix is the canonical interpreter memory model: a 256-entry pointer table indexed by `addr >> 8`. ROM/cart/RAM pages hold a direct base pointer (inlinable single load); only `$Cxxx` / `$Dxxx` I/O pages hold a sentinel that falls back to the slow VIA path. This replaces the branch ladder rather than adding to it, so net hot-code size drops, which is the key lesson from the failed builds 12/53. Those regressed because they bolted extra `if` tests inside the giant switch; a table keeps the switch bodies untouched and shrinks the hot path.
+
+2. Audit the condition-code path. `get_cc` does `(reg_cc / flag) & 1`, an integer divide (`e6809.c:84`), and `set_cc` does `value * flag` (`e6809.c:93`). These are on the hottest path (every `BEQ` / `BITA` tests flags, and those are ~40% of executed instructions per build 13). When inlined with a compile-time-constant `flag`, the compiler should strip these to shifts/masks, but given how hot they are this is worth confirming in the disassembly. A surviving divide here would be very expensive.
+
+3. Shrink the hot working set to fit I-cache. The conceptually-correct version of what builds 11/31/43 attempted: identify the ~30 opcodes that are 90% of execution (plus the machine-advance path), get that set to fit in 16 KB, and push genuinely-cold opcodes (page-2/3, rare ALU forms) out-of-line. Past splits regressed because they were mechanical (`-Os`, blanket section attributes). This needs to be data-driven from the build-35 PC-sample data and measured per step.
+
+### What to explicitly stop doing
+
+Per-opcode fast paths inside the switch, alignment roulette, and cadence tradeoffs are exhausted. The Vectrex-specific analog stepping (`vecx.c:994`, `alg_sstep`) is irreducible per-cycle work and is already batched well, so leave it alone.
+
+### Recommended next step
+
+Implement lever 1 (the page-pointer memory model) as an isolated change against the build-62 baseline and benchmark it as build 65. It is the highest ROI, it reduces hot-code size (working with the cache constraint instead of against it), and it is the one structural lever the build history has not genuinely tried.
