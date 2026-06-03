@@ -842,6 +842,7 @@ static einline void via_sstep1 (void)
 static einline void via_sstep0_batch (unsigned cycles)
 {
 	unsigned shift_cycles;
+	unsigned shift_mode;
 
 	if (via_t1on) {
 		unsigned remaining = cycles;
@@ -888,6 +889,48 @@ static einline void via_sstep0_batch (unsigned cycles)
 			int_update ();
 			via_t2int = 0;
 		}
+	}
+
+	if (via_srb >= 8) {
+		return;
+	}
+
+	shift_mode = via_acr & 0x1c;
+
+	if (shift_mode == 0x00 || shift_mode == 0x0c || shift_mode == 0x1c) {
+		return;
+	}
+
+	if (shift_mode == 0x08) {
+		shift_cycles = cycles;
+		if (shift_cycles > 8 - via_srb) {
+			shift_cycles = 8 - via_srb;
+		}
+		via_sr <<= shift_cycles;
+		via_srb += shift_cycles;
+		if (via_srb == 8) {
+			via_ifr |= 0x04;
+			int_update ();
+		}
+		return;
+	}
+
+	if (shift_mode == 0x18) {
+		shift_cycles = cycles;
+		if (shift_cycles > 8 - via_srb) {
+			shift_cycles = 8 - via_srb;
+		}
+		while (shift_cycles-- > 0) {
+			via_cb2s = (via_sr >> 7) & 1;
+			via_sr <<= 1;
+			via_sr |= via_cb2s;
+			via_srb++;
+		}
+		if (via_srb == 8) {
+			via_ifr |= 0x04;
+			int_update ();
+		}
+		return;
 	}
 
 	shift_cycles = cycles;
@@ -1261,25 +1304,14 @@ static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles)
 {
 	unsigned pc;
 	unsigned poll_mask;
-	unsigned branch_offset;
 	unsigned wait_cycles;
-	int branch_delta;
 
-	if (remaining_cycles <= 0 || e6809_get_dp () != 0xd0) {
+	if (remaining_cycles <= 0) {
 		return 0;
 	}
 
 	pc = e6809_get_pc ();
-
-	if (vecx_peek8 (pc) != 0x95 ||
-		vecx_peek8 (pc + 1) != 0x0d ||
-		vecx_peek8 (pc + 2) != 0x27) {
-		return 0;
-	}
-
-	branch_offset = vecx_peek8 (pc + 3);
-	branch_delta = (branch_offset & 0x80) ? (int) branch_offset - 0x100 : (int) branch_offset;
-	if (((pc + 4 + branch_delta) & 0xffff) != pc) {
+	if (pc != 0xf19e || e6809_get_dp () != 0xd0) {
 		return 0;
 	}
 
