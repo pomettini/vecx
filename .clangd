@@ -1,0 +1,4 @@
+CompileFlags:
+  Add:
+    - "-I/Users/pomettini/Developer/PlaydateSDK/C_API"
+    - "-DTARGET_EXTENSION=1"
