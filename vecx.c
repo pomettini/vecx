@@ -1420,7 +1420,7 @@ void vecx_emu (long cycles)
 		}
 #endif
 
-		icycles = e6809_sstep (via_ifr & 0x80, 0);
+		icycles = e6809_sstep_p (via_ifr & 0x80, 0);
 		instruction_count++;
 		cycle_count += icycles;
 

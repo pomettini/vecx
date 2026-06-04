@@ -6,11 +6,12 @@
 #include "e8910.h"
 #include "osint.h"
 #include "vecx.h"
+#include "e6809.h"
 
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
 #define BENCHMARK_LOG_MS 5000U
-#define BUILD_VARIANT "tcmrevert77"
+#define BUILD_VARIANT "tcmcontig89"
 #define BUILD_LABEL __DATE__ " " __TIME__ " " BUILD_VARIANT
 #define PERSISTENCE_FRAMES 3
 #define PERSISTENCE_VECTOR_CAP 512
@@ -18,6 +19,18 @@
 #define SAMPLE_LOG_TOP 5
 #define DIRECT_FRAMEBUFFER_RENDER 0
 #define RENDER_FRAME_SKIP 1
+
+/* build 83: relocate the real e6809_sstep (moved into the .itcm section via
+ * VECX_ITCM, so the image size stays ~constant and the source stays mapped)
+ * into the fast DTCM-backed pool, then dispatch through e6809_sstep_p.
+ */
+#if defined(TARGET_PLAYDATE)
+#define ITCM_ENABLE 1
+extern char __itcm_start[];
+extern char __itcm_end[];
+#else
+#define ITCM_ENABLE 0
+#endif
 
 static PlaydateAPI* pd;
 static int screen_w = LCD_COLUMNS;
@@ -471,6 +484,60 @@ void osint_render(void)
 	bench_total_render_ms += pd->system->getCurrentTimeMilliseconds() - start_ms;
 }
 
+/* busy-wait so the serial console drains a log line before any subsequent
+ * fault truncates it (logToConsole is buffered and lost on a hard fault).
+ */
+static void itcm_drain(void)
+{
+	uint32_t t = pd->system->getCurrentTimeMilliseconds();
+	while (pd->system->getCurrentTimeMilliseconds() - t < 150u) {
+	}
+}
+
+static void itcm_relocate(void)
+{
+#if ITCM_ENABLE
+	uintptr_t size = (uintptr_t)__itcm_end - (uintptr_t)__itcm_start;
+	uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+	uintptr_t pool = (frame - 0x2180u - size) & ~(uintptr_t)0xf;
+	uintptr_t off = ((uintptr_t)e6809_sstep & ~(uintptr_t)1) - (uintptr_t)__itcm_start;
+	const uint32_t *src = (const uint32_t *)__itcm_start;	/* cacheable reads */
+	volatile uint32_t *dst = (volatile uint32_t *)pool;	/* stop memcpy fold */
+	uint32_t words = (uint32_t)(size / 4u);
+	uint32_t i;
+
+	{
+		uintptr_t top = (frame - 0x2180u) & ~(uintptr_t)0xf;
+		uintptr_t a;
+		(void)size; (void)pool; (void)off; (void)src; (void)dst; (void)words; (void)i;
+
+		pd->system->logToConsole(
+			"vecx itcm: CONTIG PROBE down from top=%p (frame=%p)",
+			(void*)top, (void*)frame);
+		itcm_drain();
+
+		/* dense descending probe: find the first hole below the top. the last
+		 * logged contig= value is the largest contiguous safe pool, which sets
+		 * how small the relocated interpreter must be.
+		 */
+		for (a = top; a > 0x20001000u; a -= 0x40u) {
+			volatile uint32_t *p = (volatile uint32_t *)a;
+			*p = 0xC0DEC0DEu;
+			if (*p != 0xC0DEC0DEu) {
+				pd->system->logToConsole("vecx itcm: readback FAIL %p", (void*)a);
+				itcm_drain();
+				break;
+			}
+			pd->system->logToConsole(
+				"vecx itcm: ok %p contig=%u", (void*)a, (unsigned)(top - a + 0x40u));
+			itcm_drain();
+		}
+		pd->system->logToConsole("vecx itcm: CONTIG PROBE done (no hole)");
+		itcm_drain();
+	}
+#endif
+}
+
 static int update(void* userdata)
 {
 	uint32_t start_ms;
@@ -523,6 +590,7 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		load_roms();
 		e8910_init_sound();
 		vecx_reset();
+		itcm_relocate();
 		reset_benchmark(pd->system->getCurrentTimeMilliseconds());
 
 		pd->system->logToConsole("vecx: Playdate C build %s", BUILD_LABEL);

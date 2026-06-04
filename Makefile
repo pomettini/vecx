@@ -30,6 +30,16 @@ OPT = -O3 -falign-functions=32 -fomit-frame-pointer
 CPFLAGS += -flto
 LDFLAGS += -flto
 
+# build 78: local linker script adds an .itcm section for runtime relocation
+# of hot code into fast TCM-backed memory.
+override LDSCRIPT = ./link_map.ld
+
+# build 88: compile e6809.c -Os (so the relocated e6809_sstep is ~8.9KB and its
+# pool sits above the 0x20003cc0 DTCM hole), -mlong-calls (calls reach the
+# originals via absolute addresses after relocation) and -fno-lto.
+$(OBJDIR)/e6809.o: OPT := -Os -falign-functions=32 -fomit-frame-pointer
+$(OBJDIR)/e6809.o: CPFLAGS += -mlong-calls -fno-lto
+
 PLAYDATE_GAMES ?= /Volumes/PLAYDATE/Games
 
 .PHONY: install _push

@@ -1448,7 +1448,9 @@ static e_cold_ninline unsigned e6809_sstep_page2 (void)
 
 /* execute a single instruction or handle interrupts and return */
 
-unsigned e6809_sstep (unsigned irq_i, unsigned irq_f)
+unsigned (*e6809_sstep_p) (unsigned irq_i, unsigned irq_f) = e6809_sstep;
+
+unsigned VECX_ITCM e6809_sstep (unsigned irq_i, unsigned irq_f)
 {
 	unsigned op;
 	unsigned cycles = 0;

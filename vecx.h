@@ -7,6 +7,15 @@
 #define VECX_NOINLINE
 #endif
 
+/* place a function in the .itcm section so it can be relocated at runtime into
+ * fast TCM-backed SRAM. moved (not added) code keeps the image size ~constant.
+ */
+#if defined(__GNUC__) && defined(TARGET_PLAYDATE)
+#define VECX_ITCM __attribute__((section(".itcm"), noinline, used))
+#else
+#define VECX_ITCM
+#endif
+
 enum {
 	VECTREX_MHZ		= 1500000, /* speed of the vectrex being emulated */
 	VECTREX_UPDATE_HZ = 120,
