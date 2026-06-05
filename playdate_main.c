@@ -11,7 +11,7 @@
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
 #define BENCHMARK_LOG_MS 5000U
-#define BUILD_VARIANT "relocfix97"
+#define BUILD_VARIANT "win110"
 #define BUILD_LABEL __DATE__ " " __TIME__ " " BUILD_VARIANT
 #define PERSISTENCE_FRAMES 3
 #define PERSISTENCE_VECTOR_CAP 512
@@ -519,26 +519,29 @@ static void itcm_relocate(void)
 		(void*)e6809_hotcore_p);
 	itcm_drain();
 
-	/* test call from a shallow stack: if this returns, the relocated address is
-	 * executable and any later crash is stack-collision during gameplay.
+	/* probes from a shallow stack: entry exec, then the helper calls the bigger
+	 * compact interp makes (vecx_read8 / read8 -> vecx_read8).
 	 */
 	{
-		unsigned r1 = e6809_hotcore_p (0xabcdu, 0);
-		pd->system->logToConsole("vecx itcm: D1 entry=0x%x %s", r1,
-			r1 == 0x42u ? "EXEC-OK" : "BAD");
+		unsigned r = e6809_hotcore_p (0xabcdu, 0);
+		pd->system->logToConsole("vecx itcm: D1 entry=0x%x %s (pool %p-%p)",
+			r, r == 0x42u ? "EXEC-OK" : "BAD", (void*)pool, (void*)(pool + size));
 		itcm_drain();
-
-		{
-			unsigned r2 = e6809_hotcore_p (0xabceu, 0);
-			pd->system->logToConsole("vecx itcm: D2 global-read=0x%x (ok if >=0x100)", r2);
-			itcm_drain();
-		}
-
-		{
-			unsigned r3 = e6809_hotcore_p (0xabcfu, 0);
-			pd->system->logToConsole("vecx itcm: D3 call-ret=0x%x (ok if >=0x200)", r3);
-			itcm_drain();
-		}
+		r = e6809_hotcore_p (0xabceu, 0);
+		pd->system->logToConsole("vecx itcm: D2 ea_indexed call=0x%x (ok>=0x100)", r);
+		itcm_drain();
+		r = e6809_hotcore_p (0xabcfu, 0);
+		pd->system->logToConsole("vecx itcm: D3 write8 call=0x%x (ok=0x2a5)", r);
+		itcm_drain();
+		r = e6809_hotcore_p (0xabd0u, 0);
+		pd->system->logToConsole("vecx itcm: D4 inst_sub8 call=0x%x (ok=0x340)", r);
+		itcm_drain();
+		r = e6809_hotcore_p (0xabd1u, 0);
+		pd->system->logToConsole("vecx itcm: D5 read8(VIA) call=0x%x (ok>=0x400)", r);
+		itcm_drain();
+		r = e6809_hotcore_p (0xabd2u, 0);
+		pd->system->logToConsole("vecx itcm: D6 write8(VIA) call=0x%x (ok=0x500)", r);
+		itcm_drain();
 	}
 #endif
 }

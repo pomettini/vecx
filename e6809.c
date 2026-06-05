@@ -23,6 +23,13 @@
  */
 #define E6809_HOT_CORE 0
 
+/* 0x00-0x7f RMW group: OFF. Enabling it pushes e6809_hotcore past the ~1.4KB
+ * relocated-function size threshold (build 109, 1592B) that faults mid-run; the
+ * winning config (build 108, 1328B = imm/dir/idx ALU + STA, 35.5fps) keeps it
+ * off. See PLAYDATE_ITCM_GUIDE.md "relocated-size ceiling" open puzzle.
+ */
+#define HOTCORE_RMW 0
+
 #define E6809_COLD_PAGE_SPLIT 0
 
 #if E6809_COLD_PAGE_SPLIT && defined(__GNUC__)
@@ -1470,6 +1477,24 @@ static einline unsigned hot_pc_read8 (void)
 	return vecx_read8 (a);
 }
 
+static einline unsigned hot_pc_read16 (void)
+{
+	unsigned hi = hot_pc_read8 ();
+	unsigned lo = hot_pc_read8 ();
+
+	return (hi << 8) | lo;
+}
+
+static einline unsigned hot_ea_direct (void)
+{
+	return (reg_dp << 8) | hot_pc_read8 ();
+}
+
+static einline unsigned hot_ea_extended (void)
+{
+	return hot_pc_read16 ();
+}
+
 static einline unsigned hot_bra8 (unsigned test, unsigned op)
 {
 	unsigned offset = hot_pc_read8 ();
@@ -1480,6 +1505,21 @@ static einline unsigned hot_bra8 (unsigned test, unsigned op)
 	return 3;
 }
 
+static einline unsigned hot_rmw (unsigned low, unsigned v)
+{
+	switch (low) {
+	case 0x0: return inst_neg (v);
+	case 0x3: return inst_com (v);
+	case 0x4: return inst_lsr (v);
+	case 0x6: return inst_ror (v);
+	case 0x7: return inst_asr (v);
+	case 0x8: return inst_asl (v);
+	case 0x9: return inst_rol (v);
+	case 0xa: return inst_dec (v);
+	default:  return inst_inc (v); /* 0xc */
+	}
+}
+
 unsigned (*e6809_hotcore_p) (unsigned irq_i, unsigned irq_f) = e6809_hotcore;
 
 unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
@@ -1487,17 +1527,33 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 	unsigned op;
 	unsigned pc0;
 
-	/* exec-test probe: self-contained (no globals, no calls). if a test call
-	 * with irq_i==0xabcd returns 0x42, the relocated entry IS executable.
-	 */
 	if (irq_i == 0xabcdu) {
-		return 0x42u;
+		return 0x42u; /* relocated-entry exec probe */
 	}
 	if (irq_i == 0xabceu) {
-		return reg_a + 0x100u; /* global-read probe */
+		/* probe: call ea_indexed from relocated code (postbyte from cart[0]) */
+		unsigned c = 0;
+		unsigned save = reg_pc;
+		unsigned ea;
+		reg_pc = 0;
+		ea = ea_indexed (&c);
+		reg_pc = save;
+		return (ea & 0xff) + c + 0x100u;
 	}
 	if (irq_i == 0xabcfu) {
-		return e6809_sstep (0, 0) + 0x200u; /* call probe */
+		/* probe: write8 -> vecx_write8 (ram), read back */
+		write8 (0xc801u, 0xa5u);
+		return read8 (0xc801u) + 0x200u; /* expect 0xa5 + 0x200 = 0x2a5 */
+	}
+	if (irq_i == 0xabd0u) {
+		return inst_sub8 (0x50u, 0x10u) + 0x300u; /* probe: inst_sub8 (0x40+0x300=0x340) */
+	}
+	if (irq_i == 0xabd1u) {
+		return (read8 (0xd000u) & 0xff) + 0x400u; /* probe: read8 of VIA reg */
+	}
+	if (irq_i == 0xabd2u) {
+		write8 (0xd00bu, 0x00u); /* probe: write8 of VIA reg (ACR) */
+		return 0x500u;
 	}
 
 	if (irq_i || irq_f || irq_status != IRQ_NORMAL) {
@@ -1507,9 +1563,137 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 	pc0 = reg_pc;
 	op = hot_pc_read8 ();
 
+	/* 0x00-0x7f: memory RMW (hi nibble 0/6/7 = dir/idx/ext), inherent A/B (4/5),
+	 * plus tst (d), jmp (e, memory only) and clr (f). matches e6809_sstep.
+	 */
+#if HOTCORE_RMW
+	{
+		unsigned hi = op >> 4;
+
+		if (hi == 0 || hi == 4 || hi == 5 || hi == 6 || hi == 7) {
+			unsigned low = op & 0x0f;
+			unsigned is_rmw = (low == 0x0 || low == 0x3 || low == 0x4 ||
+				low == 0x6 || low == 0x7 || low == 0x8 || low == 0x9 ||
+				low == 0xa || low == 0xc);
+
+			if (hi == 4 || hi == 5) {
+				unsigned reg = (hi == 5) ? reg_b : reg_a;
+
+				if (is_rmw) {
+					reg = hot_rmw (low, reg);
+				} else if (low == 0xd) {
+					inst_tst8 (reg); /* tsta/tstb */
+				} else if (low == 0xf) {
+					inst_clr (); reg = 0; /* clra/clrb */
+				} else {
+					goto cold; /* illegal inherent */
+				}
+
+				if (hi == 5) {
+					reg_b = reg;
+				} else {
+					reg_a = reg;
+				}
+				return 2;
+			} else {
+				unsigned cycles = 0;
+				unsigned ea;
+
+				/* validate before computing ea (ea_indexed auto-inc/dec has
+				 * register side effects the cold rewind would not undo).
+				 */
+				if (!(is_rmw || low == 0xd || low == 0xe || low == 0xf)) {
+					goto cold;
+				}
+
+				if (hi == 0) {
+					ea = hot_ea_direct ();
+				} else if (hi == 6) {
+					ea = ea_indexed (&cycles);
+				} else {
+					goto cold; /* hi==7 extended: cursed when relocated, fall back */
+				}
+
+				if (low == 0xe) { /* jmp */
+					reg_pc = ea;
+					return cycles + (hi == 7 ? 4 : 3);
+				}
+				if (low == 0xd) { /* tst */
+					inst_tst8 (read8 (ea));
+					return cycles + (hi == 7 ? 7 : 6);
+				}
+				if (low == 0xf) { /* clr */
+					inst_clr ();
+					write8 (ea, 0);
+					return cycles + (hi == 7 ? 7 : 6);
+				}
+				write8 (ea, hot_rmw (low, read8 (ea)));
+				return cycles + (hi == 7 ? 7 : 6);
+			}
+		}
+	}
+#endif
+
+	/* 0x80-0xff: 8-bit accumulator ALU, decoded by addressing mode (bits 5-4),
+	 * register (bit 6) and operation (low nibble). 16-bit ops (low nibble
+	 * 3,c,e,f) and bsr/jsr/std (d) are excluded and fall through to the cold
+	 * path. matches the e6809_sstep cases exactly (cycle counts + helpers).
+	 */
+	if (op >= 0x80) {
+		unsigned low = op & 0x0f;
+
+		if (low != 0x03 && low != 0x0c && low != 0x0d &&
+			low != 0x0e && low != 0x0f) {
+			unsigned mode = (op >> 4) & 3;
+			unsigned reg = (op & 0x40) ? reg_b : reg_a;
+			unsigned cycles = 0;
+			unsigned ea, operand, result;
+
+			if (low == 0x07) {
+				/* store: dir/idx inline, ext falls back (bisect) */
+				if (mode == 1) {
+					ea = hot_ea_direct (); cycles = 4;
+				} else if (mode == 2) {
+					ea = ea_indexed (&cycles); cycles += 4;
+				} else {
+					goto cold;
+				}
+				write8 (ea, reg);
+				inst_tst8 (reg);
+				return cycles;
+			}
+
+			switch (mode) {
+			case 0: operand = hot_pc_read8 (); cycles = 2; break;
+			case 1: ea = hot_ea_direct (); operand = read8 (ea); cycles = 4; break;
+			case 2: ea = ea_indexed (&cycles); operand = read8 (ea); cycles += 4; break;
+			default: goto cold; /* bisect: fall back extended */
+			}
+
+			switch (low) {
+			case 0x0: result = inst_sub8 (reg, operand); break;
+			case 0x1: inst_sub8 (reg, operand); result = reg; break; /* cmp */
+			case 0x2: result = inst_sbc (reg, operand); break;
+			case 0x4: result = inst_and (reg, operand); break;
+			case 0x5: inst_and (reg, operand); result = reg; break; /* bit */
+			case 0x6: result = operand; inst_tst8 (result); break; /* ld */
+			case 0x8: result = inst_eor (reg, operand); break;
+			case 0x9: result = inst_adc (reg, operand); break;
+			case 0xa: result = inst_or (reg, operand); break;
+			default:  result = inst_add8 (reg, operand); break; /* 0xb add */
+			}
+
+			if (op & 0x40) {
+				reg_b = result;
+			} else {
+				reg_a = result;
+			}
+			return cycles;
+		}
+	}
+
 	switch (op) {
 	case 0x12: return 2; /* nop */
-
 	case 0x20: case 0x21: return hot_bra8 (0, op);
 	case 0x22: case 0x23: return hot_bra8 (get_cc (FLAG_C) | get_cc (FLAG_Z), op);
 	case 0x24: case 0x25: return hot_bra8 (get_cc (FLAG_C), op);
@@ -1519,15 +1703,13 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 	case 0x2c: case 0x2d: return hot_bra8 (get_cc (FLAG_N) ^ get_cc (FLAG_V), op);
 	case 0x2e: case 0x2f: return hot_bra8 (get_cc (FLAG_Z) |
 						  (get_cc (FLAG_N) ^ get_cc (FLAG_V)), op);
-
-	/* immediate load (small + common) */
-	case 0x86: reg_a = hot_pc_read8 (); inst_tst8 (reg_a); return 2;
-	case 0xc6: reg_b = hot_pc_read8 (); inst_tst8 (reg_b); return 2;
-
 	default:
-		reg_pc = pc0;
-		return e6809_sstep (0, 0);
+		break;
 	}
+
+cold:
+	reg_pc = pc0;
+	return e6809_sstep (0, 0);
 }
 
 /* execute a single instruction or handle interrupts and return */

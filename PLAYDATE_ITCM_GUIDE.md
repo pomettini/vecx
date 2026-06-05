@@ -220,17 +220,48 @@ switch-interpreter does not.
 MEASURED PAYOFF (vecx, build 97): a ~1 KB hot-opcode core (NOP/branches/imm-ALU,
 ~35% of executed opcodes) relocated to TCM ran the game at ~30.5 FPS — up from
 ~29.1 FPS for the SAME core running in slow memory (fast memory gave a real +1.4
-FPS), but still below the 33.2 FPS plain baseline. Why below baseline: the
-hot-core + fallback design makes the ~65% cold opcodes pay an extra dispatch and
-re-fetch (`hotcore -> e6809_sstep`, two calls vs baseline's one), and that
-overhead outweighs the fast-memory win on the hot 35%. So: **TCM execution helps,
-but a hot-core-with-fallback masks it.** Only a FULL compact interpreter in TCM
-(every opcode handled once, no fallback) would realize the benefit cleanly — and
-even then it is bounded by the irreducible data-side cost (opcode/operand fetches
-read cart/rom and memory operands read ram/io, all in slow RAM, regardless of
-where the code lives). Don't expect TCM code relocation alone to be a silver
-bullet for a memory/data-bound interpreter; it mainly removes the I-cache/code
-miss component.
+FPS), but still below the 33.2 FPS plain baseline, because the hot-core+fallback
+design makes the ~65% cold opcodes pay an extra dispatch (`hotcore -> e6809_sstep`).
+
+**BIGGER PAYOFF (vecx, build 108/110): a wider compact core BEATS baseline —
+35.5 FPS vs 33.2 (+7%).** Going from ~35% to ~85-90% of executed opcodes handled
+inline in TCM (8-bit ALU imm/dir/idx + STA, decoded by addr-mode/reg/op-nibble;
+only extended/16-bit/stack/misc fall back) flips the result: the fallback is now
+rare enough that the fast-memory win on the hot path dominates. So the trend is
+real and monotonic — **the more of the hot path you cover in TCM, the better, and
+once the fallback is rare it clears baseline.** Still bounded by the irreducible
+data-side cost (opcode/operand fetches read cart/rom, memory operands read ram/io,
+all in slow RAM regardless of where the code lives); TCM relocation removes the
+I-cache/code-miss component, not the data-miss component.
+
+### Open puzzle: a relocated-function SIZE ceiling (~1.4 KB)
+On this device the relocated `e6809_hotcore` runs correctly at <=1328 bytes but
+**hard-faults mid-execution at >=1592 bytes** — even though, at the larger size:
+the entry executes (probe returns), EVERY helper call works from the relocated
+copy (proven by per-callee probes: vecx_read8, ea_indexed, write8, inst_*,
+read8/write8 of VIA), and objdump shows the `.itcm` block is structurally clean
+(all relocs `R_ARM_ABS32` in `.rel.text`, no escaping relative branches, no
+constprop clones, no pc-relative load whose literal lands outside the copied
+block). It is NOT relocation, NOT XN (single-word writes reach ~29 KB down; entry
+execs), NOT stack collision (pool top = `frame-0x2180` is constant for all sizes,
+so a bigger function extends only DOWNWARD, away from the live stack), NOT a
+clone. Beware: a confounded bisection first made it look opcode-specific
+("extended addressing is cursed") because adding ext grew the function past the
+ceiling — the real variable was total size. **Mechanism still unknown.** Untested
+hypotheses: literal-pool/veneer placement past a certain offset, a tbb/tbh table
+whose computed reach changes, or a Cortex-M7 DTCM instruction-fetch quirk for
+larger contiguous spans. WORKAROUND that ships: keep the relocated function
+<=~1.3 KB (cover the hottest opcodes, leave the rest as fallback). If you need
+more coverage, split into two <=1.3 KB relocated functions, or chase the
+mechanism (next step: binary-search the exact byte threshold with padding, then
+diff the objdump at the boundary).
+
+Method note — **how to bisect a relocated-execution crash**: gate each decode
+path behind a compile flag and selectively `goto cold` (fall back) per addressing
+mode / opcode group; relocated builds that fall back enough to run vs crash
+localize the trigger in a few device cycles. Pair with per-callee entry probes
+(magic `irq_i` values that return a sentinel) to prove the relocation plumbing
+itself is sound before suspecting any one opcode.
 
 Checklist to make relocated code actually run:
 1. `.itcm` INPUT collected inside the `.text` OUTPUT section (relocations
