@@ -27,19 +27,20 @@ SECTIONS
 
 		*(.rodata*)
 
-		KEEP(*(.eh_frame*))
-
-	}
-
-	/* runtime-relocatable hot code, bounded by __itcm_start/__itcm_end */
-	.itcm :
-	{
+		/* runtime-relocatable hot code, bounded by __itcm_start/__itcm_end.
+		 * kept INSIDE .text so its R_ARM_ABS32 relocations land in .rel.text
+		 * and are applied by the loader (a separate .itcm output section is
+		 * NOT relocated by the Playdate loader, leaving address literals bad).
+		 */
 		. = ALIGN(16);
 		__itcm_start = .;
 		*(.itcm)
 		*(.itcm.*)
 		. = ALIGN(16);
 		__itcm_end = .;
+
+		KEEP(*(.eh_frame*))
+
 	}
 
 	.data :

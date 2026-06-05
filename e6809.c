@@ -1446,11 +1446,93 @@ static e_cold_ninline unsigned e6809_sstep_page2 (void)
 	return cycles;
 }
 
+/* ----- build 91: compact hot-opcode core (TCM payoff test) -----
+ * handles the common PC/register-only opcodes (NOP, branches, immediate ALU)
+ * with an INLINED opcode/operand fetch (direct cart/rom/ram reads, no slow
+ * vecx_read8 call), and falls back to the full e6809_sstep for everything else.
+ * small enough (~few KB) to relocate into the fast TCM pool. handlers are
+ * bit-exact copies of their e6809_sstep cases with pc_read8 -> hot_pc_read8.
+ */
+
+static einline unsigned hot_pc_read8 (void)
+{
+	unsigned a = reg_pc & 0xffff;
+
+	reg_pc++;
+
+	if (a < 0x8000) {
+		return cart[a];
+	}
+	if ((a & 0xe000) == 0xe000) {
+		return rom[a & 0x1fff];
+	}
+	/* ram / io / unmapped (rare for code or immediate operands) */
+	return vecx_read8 (a);
+}
+
+static einline unsigned hot_bra8 (unsigned test, unsigned op)
+{
+	unsigned offset = hot_pc_read8 ();
+	unsigned mask = (test ^ (op & 1)) - 1;
+
+	reg_pc += sign_extend (offset) & mask;
+
+	return 3;
+}
+
+unsigned (*e6809_hotcore_p) (unsigned irq_i, unsigned irq_f) = e6809_hotcore;
+
+unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
+{
+	unsigned op;
+	unsigned pc0;
+
+	/* exec-test probe: self-contained (no globals, no calls). if a test call
+	 * with irq_i==0xabcd returns 0x42, the relocated entry IS executable.
+	 */
+	if (irq_i == 0xabcdu) {
+		return 0x42u;
+	}
+	if (irq_i == 0xabceu) {
+		return reg_a + 0x100u; /* global-read probe */
+	}
+	if (irq_i == 0xabcfu) {
+		return e6809_sstep (0, 0) + 0x200u; /* call probe */
+	}
+
+	if (irq_i || irq_f || irq_status != IRQ_NORMAL) {
+		return e6809_sstep (irq_i, irq_f);
+	}
+
+	pc0 = reg_pc;
+	op = hot_pc_read8 ();
+
+	switch (op) {
+	case 0x12: return 2; /* nop */
+
+	case 0x20: case 0x21: return hot_bra8 (0, op);
+	case 0x22: case 0x23: return hot_bra8 (get_cc (FLAG_C) | get_cc (FLAG_Z), op);
+	case 0x24: case 0x25: return hot_bra8 (get_cc (FLAG_C), op);
+	case 0x26: case 0x27: return hot_bra8 (get_cc (FLAG_Z), op);
+	case 0x28: case 0x29: return hot_bra8 (get_cc (FLAG_V), op);
+	case 0x2a: case 0x2b: return hot_bra8 (get_cc (FLAG_N), op);
+	case 0x2c: case 0x2d: return hot_bra8 (get_cc (FLAG_N) ^ get_cc (FLAG_V), op);
+	case 0x2e: case 0x2f: return hot_bra8 (get_cc (FLAG_Z) |
+						  (get_cc (FLAG_N) ^ get_cc (FLAG_V)), op);
+
+	/* immediate load (small + common) */
+	case 0x86: reg_a = hot_pc_read8 (); inst_tst8 (reg_a); return 2;
+	case 0xc6: reg_b = hot_pc_read8 (); inst_tst8 (reg_b); return 2;
+
+	default:
+		reg_pc = pc0;
+		return e6809_sstep (0, 0);
+	}
+}
+
 /* execute a single instruction or handle interrupts and return */
 
-unsigned (*e6809_sstep_p) (unsigned irq_i, unsigned irq_f) = e6809_sstep;
-
-unsigned VECX_ITCM e6809_sstep (unsigned irq_i, unsigned irq_f)
+unsigned e6809_sstep (unsigned irq_i, unsigned irq_f)
 {
 	unsigned op;
 	unsigned cycles = 0;

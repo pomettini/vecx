@@ -117,6 +117,78 @@ emulators. Every claim here was verified on device (PDU1-Y024621), builds 68–8
    the function, so it moves with the code — fine. Watch for any `.rodata` jump
    tables (absolute) which would NOT move; pull them into .itcm too if present.
 
+7. **THE BIG ONE — a separate `.itcm` output section is NOT relocated by the
+   loader.** The Playdate ships relocatable images (`--emit-relocs`); the loader
+   fixes up `R_ARM_ABS32` literals at load time. The toolchain here uses
+   `-mword-relocations`, so EVERY address (globals like `&reg_a`, and call
+   targets like `&e6809_sstep` under `-mlong-calls`) is an absolute `.word`
+   literal that the loader must patch. **But the loader only patches relocations
+   for the standard output sections (`.text`/`.data`/`.bss`). A custom output
+   section named `.itcm` gets its relocations in a separate `.rel.itcm` that the
+   loader IGNORES** — so those literals keep their link-time (garbage/offset)
+   values. Result: a relocated function that touches NO globals and makes NO
+   calls runs fine (build-73-style self-test), but the instant it reads a global
+   or calls out, it dereferences a bad literal and HARD-FAULTS.
+   - Symptom that fingerprints this: a self-contained probe at the relocated
+     entry returns correctly, but a probe that reads one global crashes.
+   - **FIX: do NOT give `.itcm` its own output section. Collect the `.itcm`
+     INPUT sections INSIDE the `.text` OUTPUT section**, bracketed by
+     `__itcm_start`/`__itcm_end`, e.g.:
+     ```
+     .text :
+     {
+         *(.text) *(.text.*)
+         *(.rodata*)
+         . = ALIGN(16);
+         __itcm_start = .;
+         *(.itcm)
+         . = ALIGN(16);
+         __itcm_end = .;
+         KEEP(*(.eh_frame*))
+     }
+     ```
+     Now the relocations land in `.rel.text`, the loader applies them, and the
+     copied code's global/call literals are correct. (Verify: `readelf -S` shows
+     NO separate `.itcm` section; `__itcm_start/end` still defined.)
+
+## Hot-core architecture (small relocated core + slow fallback)
+
+The full interpreter won't fit the ~4KB pool, so relocate only a compact
+hot-opcode core and fall back to the full (slow) interpreter for cold opcodes:
+
+```c
+unsigned VECX_ITCM e6809_hotcore(unsigned irq_i, unsigned irq_f) {
+    if (irq_i || irq_f || special_state) return e6809_sstep(irq_i, irq_f); /* delegate */
+    unsigned pc0 = reg_pc;
+    unsigned op = hot_pc_read8();              /* INLINED cart/rom fetch */
+    switch (op) {
+    case 0x12: return 2;                       /* hot ops: bit-exact copies of */
+    /* ... NOP, branches, immediate ALU ... */ /* the e6809_sstep cases */
+    default: reg_pc = pc0; return e6809_sstep(0, 0); /* cold: rewind + full interp */
+    }
+}
+```
+- Dispatch `vecx_emu` through a pointer (`e6809_hotcore_p`) that init repoints to
+  the relocated copy. Validate correctness IN PLACE first (matching
+  instr-count/CPI vs baseline ⇒ bit-exact) before adding relocation.
+- COST: cold opcodes pay a double fetch/dispatch (hot core + full interp). That
+  is a ~12% regression when the hot core runs in SLOW memory; it only pays off
+  once the hot core is in fast TCM (the double-dispatch overhead becomes cheap
+  and the hot opcodes run single-cycle). So an in-place hot core looking slower
+  is expected and not predictive of the relocated result.
+- Inline the fetch (`cart[a]`/`rom[a&0x1fff]`) so hot ops never call the slow
+  `vecx_read8`; let rare cases (RAM/IO PC) fall to `vecx_read8`.
+
+## Debugging recipe that cracked this (isolation probes)
+
+Add self-contained probes at the function entry, keyed by magic argument values,
+each testing ONE capability, and call them from a shallow stack at init:
+`return 0x42` (entry executable?), `return some_global` (data reloc ok?),
+`return callee()` (call reloc ok?). Whichever probe is the last to log before a
+crash names the exact broken capability. This separated "is it XN?" (no — entry
+executed) from "is it the relocation?" (yes — global read faulted) in two builds
+instead of guessing. Confirmed executable down to at least 0x20007660.
+
 ## Debugging on device (essential, because crashes hide info)
 
 - **`logToConsole` output is LOST on a hard fault** (it's buffered). After each
@@ -136,11 +208,36 @@ emulators. Every claim here was verified on device (PDU1-Y024621), builds 68–8
   `frame-0x2180`, writing one word per 64 bytes, draining after each, until it
   faults. Last logged address = the floor of the contiguous region.
 
-## Verdict for a ~20 KB interpreter
+## Verdict / status
 
-Code-fetch from slow PSRAM is the dominant cost (~265 cyc/miss, ~7–8 misses per
-emulated instruction => ~2000 host cyc/instr). Putting the hot core in DTCM
-fixes that — but the contiguous pool is ~4 KB, so a 20 KB switch-interpreter
-does not fit. You must **rewrite the core compact (decoded/table-driven) to
-≤ ~4 KB** to relocate it as one block. That is the only path to the win on this
-hardware, and it is a large, correctness-sensitive rewrite.
+End-to-end relocation of a real, global-touching, call-making function into the
+fast DTCM pool WORKS once all the above is handled (proven build 97: entry +
+global-read + call probes all pass from the relocated copy). The remaining
+constraint is size: the contiguous safe pool is ~4 KB, so only a compact
+hot-opcode core (or a fully rewritten ≤4 KB decoded interpreter) fits. A 20 KB
+switch-interpreter does not.
+
+MEASURED PAYOFF (vecx, build 97): a ~1 KB hot-opcode core (NOP/branches/imm-ALU,
+~35% of executed opcodes) relocated to TCM ran the game at ~30.5 FPS — up from
+~29.1 FPS for the SAME core running in slow memory (fast memory gave a real +1.4
+FPS), but still below the 33.2 FPS plain baseline. Why below baseline: the
+hot-core + fallback design makes the ~65% cold opcodes pay an extra dispatch and
+re-fetch (`hotcore -> e6809_sstep`, two calls vs baseline's one), and that
+overhead outweighs the fast-memory win on the hot 35%. So: **TCM execution helps,
+but a hot-core-with-fallback masks it.** Only a FULL compact interpreter in TCM
+(every opcode handled once, no fallback) would realize the benefit cleanly — and
+even then it is bounded by the irreducible data-side cost (opcode/operand fetches
+read cart/rom and memory operands read ram/io, all in slow RAM, regardless of
+where the code lives). Don't expect TCM code relocation alone to be a silver
+bullet for a memory/data-bound interpreter; it mainly removes the I-cache/code
+miss component.
+
+Checklist to make relocated code actually run:
+1. `.itcm` INPUT collected inside the `.text` OUTPUT section (relocations
+   applied) — the #1 gotcha.
+2. Manual word-copy (not memcpy), cacheable `const` source, `volatile` dest.
+3. Pool in the ~4 KB hole-free region near `frame-0x2180` (avoid the firmware
+   holes; place to also avoid the game's deep render stack).
+4. `-mlong-calls -fno-lto` on the relocated TU; verify no direct branch leaves
+   `.itcm`; jump tables inline.
+5. `clearICache()` after copy; call via pointer with Thumb bit set.

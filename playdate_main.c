@@ -11,7 +11,7 @@
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
 #define BENCHMARK_LOG_MS 5000U
-#define BUILD_VARIANT "tcmcontig89"
+#define BUILD_VARIANT "relocfix97"
 #define BUILD_LABEL __DATE__ " " __TIME__ " " BUILD_VARIANT
 #define PERSISTENCE_FRAMES 3
 #define PERSISTENCE_VECTOR_CAP 512
@@ -20,10 +20,6 @@
 #define DIRECT_FRAMEBUFFER_RENDER 0
 #define RENDER_FRAME_SKIP 1
 
-/* build 83: relocate the real e6809_sstep (moved into the .itcm section via
- * VECX_ITCM, so the image size stays ~constant and the source stays mapped)
- * into the fast DTCM-backed pool, then dispatch through e6809_sstep_p.
- */
 #if defined(TARGET_PLAYDATE)
 #define ITCM_ENABLE 1
 extern char __itcm_start[];
@@ -484,56 +480,65 @@ void osint_render(void)
 	bench_total_render_ms += pd->system->getCurrentTimeMilliseconds() - start_ms;
 }
 
-/* busy-wait so the serial console drains a log line before any subsequent
- * fault truncates it (logToConsole is buffered and lost on a hard fault).
- */
 static void itcm_drain(void)
 {
 	uint32_t t = pd->system->getCurrentTimeMilliseconds();
-	while (pd->system->getCurrentTimeMilliseconds() - t < 150u) {
+	while (pd->system->getCurrentTimeMilliseconds() - t < 120u) {
 	}
 }
 
+/* relocate the hot core into the fast TCM pool (manual cacheable word-copy into
+ * the ~4KB safe region above the firmware holes; see PLAYDATE_ITCM_GUIDE.md).
+ */
 static void itcm_relocate(void)
 {
 #if ITCM_ENABLE
 	uintptr_t size = (uintptr_t)__itcm_end - (uintptr_t)__itcm_start;
 	uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
 	uintptr_t pool = (frame - 0x2180u - size) & ~(uintptr_t)0xf;
-	uintptr_t off = ((uintptr_t)e6809_sstep & ~(uintptr_t)1) - (uintptr_t)__itcm_start;
-	const uint32_t *src = (const uint32_t *)__itcm_start;	/* cacheable reads */
-	volatile uint32_t *dst = (volatile uint32_t *)pool;	/* stop memcpy fold */
+	uintptr_t off = ((uintptr_t)e6809_hotcore & ~(uintptr_t)1) - (uintptr_t)__itcm_start;
+	const uint32_t *src = (const uint32_t *)__itcm_start;
+	volatile uint32_t *dst = (volatile uint32_t *)pool;
 	uint32_t words = (uint32_t)(size / 4u);
 	uint32_t i;
 
-	{
-		uintptr_t top = (frame - 0x2180u) & ~(uintptr_t)0xf;
-		uintptr_t a;
-		(void)size; (void)pool; (void)off; (void)src; (void)dst; (void)words; (void)i;
+	pd->system->logToConsole(
+		"vecx itcm: A src=%p dst=%p size=%u hotcore=%p", (void*)__itcm_start,
+		(void*)pool, (unsigned)size, (void*)e6809_hotcore);
+	itcm_drain();
 
-		pd->system->logToConsole(
-			"vecx itcm: CONTIG PROBE down from top=%p (frame=%p)",
-			(void*)top, (void*)frame);
+	for (i = 0; i < words; i++)
+		dst[i] = src[i];
+	pd->system->logToConsole("vecx itcm: B copy done (%u words)", words);
+	itcm_drain();
+
+	pd->system->clearICache();
+	e6809_hotcore_p = (unsigned (*)(unsigned, unsigned))((pool + off) | 1u);
+	pd->system->logToConsole(
+		"vecx itcm: C hotcore relocated %p -> %p", (void*)e6809_hotcore,
+		(void*)e6809_hotcore_p);
+	itcm_drain();
+
+	/* test call from a shallow stack: if this returns, the relocated address is
+	 * executable and any later crash is stack-collision during gameplay.
+	 */
+	{
+		unsigned r1 = e6809_hotcore_p (0xabcdu, 0);
+		pd->system->logToConsole("vecx itcm: D1 entry=0x%x %s", r1,
+			r1 == 0x42u ? "EXEC-OK" : "BAD");
 		itcm_drain();
 
-		/* dense descending probe: find the first hole below the top. the last
-		 * logged contig= value is the largest contiguous safe pool, which sets
-		 * how small the relocated interpreter must be.
-		 */
-		for (a = top; a > 0x20001000u; a -= 0x40u) {
-			volatile uint32_t *p = (volatile uint32_t *)a;
-			*p = 0xC0DEC0DEu;
-			if (*p != 0xC0DEC0DEu) {
-				pd->system->logToConsole("vecx itcm: readback FAIL %p", (void*)a);
-				itcm_drain();
-				break;
-			}
-			pd->system->logToConsole(
-				"vecx itcm: ok %p contig=%u", (void*)a, (unsigned)(top - a + 0x40u));
+		{
+			unsigned r2 = e6809_hotcore_p (0xabceu, 0);
+			pd->system->logToConsole("vecx itcm: D2 global-read=0x%x (ok if >=0x100)", r2);
 			itcm_drain();
 		}
-		pd->system->logToConsole("vecx itcm: CONTIG PROBE done (no hole)");
-		itcm_drain();
+
+		{
+			unsigned r3 = e6809_hotcore_p (0xabcfu, 0);
+			pd->system->logToConsole("vecx itcm: D3 call-ret=0x%x (ok if >=0x200)", r3);
+			itcm_drain();
+		}
 	}
 #endif
 }
