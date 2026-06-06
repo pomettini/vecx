@@ -320,3 +320,26 @@ Per-opcode fast paths inside the switch, alignment roulette, and cadence tradeof
 ### Recommended next step
 
 Implement lever 1 (the page-pointer memory model) as an isolated change against the build-62 baseline and benchmark it as build 65. It is the highest ROI, it reduces hot-code size (working with the cache constraint instead of against it), and it is the one structural lever the build history has not genuinely tried.
+
+## Rendering / legible text (2026-06-06)
+
+After the perf work, focus shifted to making small Vectrex text (e.g. the boot screen, menus) legible on the 400x240 1-bit display. It looked like a rendering problem; it was not.
+
+### The font bug was `VECX_FAST_BATCH`, not the renderer
+
+Symptom: text rendered as illegible dashes/sparse ticks at any size. Every *renderer* lever was tried and ALL failed to change it: orientation/transpose, 2x supersampling, persistence accumulation (3->10 frames), render-rate, crank zoom. That this was unaffected by 2x supersampling proved the missing detail was not in the pixels but in the **vector list** - the emulation was producing the wrong strokes.
+
+Root cause: `vecx.c` `#define VECX_FAST_BATCH 1` used `alg_sstep_batch` / `via_sstep0_batch` to step the analog beam + VIA timers over many cycles at once. The VIA T1 timer sets the beam-ramp duration (= stroke length); batching approximates its mid-batch expiry, so stroke lengths come out wrong and the BIOS vector font is mangled. **Fix: `VECX_FAST_BATCH 0`** (per-cycle `alg_sstep`/`via_sstep0`) -> correct strokes, legible text. `VECX_WAIT_LOOP_SKIP` stays 1 (it skips only the idle wait, never touches the beam, and is the big speed lever). Cost: per-cycle stepping lowers throughput vs the 38.2 layout, but the user prioritized correct/legible rendering and smoothness over the FPS ceiling.
+
+Methodology lesson: when *every* rendering change leaves the output identical, stop touching the renderer - the defect is upstream in the data. The user's "it's a float/approximation problem, not resolution" instinct pointed straight at the batched integration.
+
+### Render decoupled from the update rate (complete frames)
+
+`vecx_finish_vector_frame` renders + resets the vector list every `FCYCLES_INIT = VECTREX_MHZ / VECTREX_PDECAY` cycles. With `PDECAY = RENDER_HZ = UPDATE_HZ = 120` that fired every 12500 cycles - mid-redraw, since a full Vectrex screen is ~30000 cycles - so each frame held only ~42% of the screen's strokes (matched the measured ~140 of ~330 vectors). Persistence could not recover it (the wait-skip resyncs the same partial slice each frame). Fix: decouple `VECTREX_RENDER_HZ = 50` (keep `UPDATE_HZ = 120`) so one full ~30000-cycle redraw accumulates per render = complete frames. Side benefit: rendering less often left more time for emulation (~37 -> ~41 updates/sec).
+
+### Renderer (render.c, linked last = FPS-safe per the Makefile note)
+
+- Direct mapping (no transpose, no flips) = upright, matches a real Vectrex and the ESPboy port. Getting here took a flip saga; the key realization was that "180 degree rotation" = mirror X + flip Y, so the correct upright view is plain `x=vx, y=vy`.
+- System-menu **Rotation** item: `-90 / 0 / 90` (0 default) for left/upright/right; rotated modes transpose the content.
+- **FIT** scaling: fill the limiting screen axis keeping the Vectrex aspect ratio, bars on the other axis, no cropping.
+- Removed after they didn't pan out: crank zoom, 2x supersampling, the direct-framebuffer path, and the vector-length diagnostic. Persistence kept but `#if`-gated off (it doubles moving objects at the 50Hz render rate).
