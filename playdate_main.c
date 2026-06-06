@@ -34,7 +34,6 @@
 #define POOL_NUDGE 0u
 #define BUILD_LABEL __DATE__ " " __TIME__ " " BUILD_VARIANT
 #define SAMPLE_LOG_TOP 5
-#define RENDER_FRAME_SKIP 1
 
 #if defined(TARGET_PLAYDATE)
 #define ITCM_ENABLE 1
@@ -318,10 +317,11 @@ void osint_render(void)
 {
 	uint32_t start_ms = pd->system->getCurrentTimeMilliseconds();
 	uint32_t drawn_vectors;
+	int skip = render_frame_skip();
 
-	if (RENDER_FRAME_SKIP > 1) {
+	if (skip > 0) {
 		render_skip_phase++;
-		if (render_skip_phase < RENDER_FRAME_SKIP) {
+		if (render_skip_phase <= skip) {
 			bench_skipped_frames++;
 			return;
 		}

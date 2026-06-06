@@ -148,6 +148,22 @@ static void rotation_menu_callback(void *userdata)
 	update_scaling();
 }
 
+/* render every (frame_skip + 1)th frame; the rest are skipped. Selected via menu. */
+static PDMenuItem *frameskip_item;
+static const char *frameskip_options[] = { "0", "1", "2" };
+static int frame_skip;
+
+static void frameskip_menu_callback(void *userdata)
+{
+	(void)userdata;
+	frame_skip = pd->system->getMenuItemValue(frameskip_item);
+}
+
+int render_frame_skip(void)
+{
+	return frame_skip;
+}
+
 void render_init(PlaydateAPI *playdate, int screen_width, int screen_height)
 {
 	pd = playdate;
@@ -159,6 +175,11 @@ void render_init(PlaydateAPI *playdate, int screen_width, int screen_height)
 		(int)(sizeof(rotation_options) / sizeof(rotation_options[0])),
 		rotation_menu_callback, NULL);
 	pd->system->setMenuItemValue(rotation_item, ROT_NONE); /* default 0 degrees */
+
+	frameskip_item = pd->system->addOptionsMenuItem(
+		"Frameskip", frameskip_options,
+		(int)(sizeof(frameskip_options) / sizeof(frameskip_options[0])),
+		frameskip_menu_callback, NULL); /* default index 0 = no frameskip */
 
 	update_scaling();
 }

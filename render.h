@@ -19,4 +19,7 @@ void render_init(PlaydateAPI *playdate, int screen_width, int screen_height);
  */
 uint32_t render_draw_frame(void);
 
+/* menu-selected frameskip: 0 = render every frame, N = skip N frames between renders. */
+int render_frame_skip(void);
+
 #endif /* RENDER_H */

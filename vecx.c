@@ -7,12 +7,14 @@
 #include "e8910.h"
 
 #define einline __inline
-/* FAST_BATCH must stay 0: batching the analog/VIA stepping over multiple cycles
- * approximates the beam-ramp timing and mangles the font (strokes wrong length).
- * WAIT_LOOP_SKIP is the big speed lever (skips the BIOS idle wait) and does NOT
- * affect the beam, so keep it on.
+/* FAST_BATCH batches the analog/VIA stepping over multiple cycles. Batching
+ * blindly mangles the font, because it samples the beam ramp (Timer-1 PB7, which
+ * sets stroke length) once per batch; vecx_machine_advance now caps each batch at
+ * the next PB7 toggle so the ramp is constant within a batch -> correct font AND
+ * batched speed. WAIT_LOOP_SKIP skips the BIOS idle wait (big speed lever, never
+ * touches the beam).
  */
-#define VECX_FAST_BATCH 0
+#define VECX_FAST_BATCH 1
 #define VECX_MACHINE_ADVANCE_BATCH 1
 #define VECX_WAIT_LOOP_SKIP 1
 #define VECX_BIOS_DELAY_SKIP 0
@@ -1247,6 +1249,26 @@ static einline void vecx_machine_advance (unsigned cycles)
 		}
 
 #if VECX_FAST_BATCH
+		/* Keep the batched beam ramp constant: don't step past the next Timer-1
+		 * PB7 toggle, which flips the ramp (= stroke length). Capping here is what
+		 * lets FAST_BATCH stay font-correct. The T1 period (a stroke) is far longer
+		 * than an instruction, so this rarely shortens a batch. */
+		if (via_t1on && (via_acr & 0x80) && ((via_acr & 0x40) || via_t1int)) {
+			unsigned t1_event = (via_t1c & 0xffff);
+
+			if (t1_event == 0)
+				t1_event = 1; /* expiry happens on the next cycle; take it */
+			if (step > t1_event)
+				step = t1_event;
+		}
+
+		/* While the shift register is clocking out the CB2 blank (via_acr & 0x10,
+		 * via_srb < 8), the beam blank can flip every shift; step one cycle at a
+		 * time through that window so the batched beam sees the right blank. The
+		 * SR is idle (batchable) most of the time -- only the beam-on pulses pay. */
+		if ((via_acr & 0x10) && via_srb < 8)
+			step = 1;
+
 		via_sstep0_batch (step);
 		alg_sstep_batch (step);
 		via_sstep1 ();
