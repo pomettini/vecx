@@ -32,6 +32,11 @@ SECTIONS
 		 * and are applied by the loader (a separate .itcm output section is
 		 * NOT relocated by the Playdate loader, leaving address literals bad).
 		 */
+		/* 32-byte aligned so the relocated copy can match the function's own
+		 * -falign-functions=32 alignment (the decode is alignment-sensitive when
+		 * executed from TCM; a mismatched offset costs ~12%). __itcm_start at 32
+		 * makes the hot core's offset 0, and the runtime pool is 32-aligned too.
+		 */
 		. = ALIGN(16);
 		__itcm_start = .;
 		*(.itcm)

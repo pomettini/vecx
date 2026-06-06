@@ -16,7 +16,14 @@
 
 unsigned char rom[8192];
 unsigned char cart[32768];
-static unsigned char ram[1024];
+/* ram is a plain (non-relocated) array: it stays D-cache-resident. Exposed
+ * (non-static) so the relocated hot core can inline reads of it (hot_read8),
+ * skipping the vecx_read8 dispatch CALL for side-effect-free $C8xx accesses.
+ * NOTE: a DTCM-relocation experiment (build 118) made ram a POINTER into a fast
+ * DTCM buffer and REGRESSED -4.5%: the 1KB ram already fit the D-cache, so DTCM
+ * bought nothing while the pointer indirection cost. Keep it a fixed array.
+ */
+unsigned char ram[1024];
 
 /* the sound chip registers */
 

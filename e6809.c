@@ -23,12 +23,10 @@
  */
 #define E6809_HOT_CORE 0
 
-/* 0x00-0x7f RMW group: OFF. Enabling it pushes e6809_hotcore past the ~1.4KB
- * relocated-function size threshold (build 109, 1592B) that faults mid-run; the
- * winning config (build 108, 1328B = imm/dir/idx ALU + STA, 35.5fps) keeps it
- * off. See PLAYDATE_ITCM_GUIDE.md "relocated-size ceiling" open puzzle.
+/* include the 0x00-0x7f RMW/inherent/TST/JMP/CLR group in the relocated compact
+ * core (vs. falling back to e6809_sstep for it).
  */
-#define HOTCORE_RMW 0
+#define HOTCORE_RMW 1
 
 #define E6809_COLD_PAGE_SPLIT 0
 
@@ -923,7 +921,7 @@ static einline void inst_bra16 (unsigned test, unsigned op, unsigned *cycles)
 
 /* instruction: pshs/pshu */
 
-static einline void inst_psh (unsigned op, unsigned *sp,
+static __attribute__((noinline)) void inst_psh (unsigned op, unsigned *sp,
 					   unsigned data, unsigned *cycles)
 {
 	if (op & 0x80) {
@@ -970,7 +968,7 @@ static einline void inst_psh (unsigned op, unsigned *sp,
 
 /* instruction: puls/pulu */
 
-static einline void inst_pul (unsigned op, unsigned *sp, unsigned *osp,
+static __attribute__((noinline)) void inst_pul (unsigned op, unsigned *sp, unsigned *osp,
 					   unsigned *cycles)
 {
 	if (op & 0x01) {
@@ -1100,7 +1098,7 @@ static einline void exgtfr_write (unsigned reg, unsigned data)
 
 /* instruction: exg */
 
-static einline void inst_exg (void)
+static __attribute__((noinline)) void inst_exg (void)
 {
 	unsigned op, tmp;
 
@@ -1113,7 +1111,7 @@ static einline void inst_exg (void)
 
 /* instruction: tfr */
 
-static einline void inst_tfr (void)
+static __attribute__((noinline)) void inst_tfr (void)
 {
 	unsigned op;
 
@@ -1485,6 +1483,41 @@ static einline unsigned hot_pc_read16 (void)
 	return (hi << 8) | lo;
 }
 
+/* operand read with the side-effect-free regions (cart/rom/ram) inlined, so the
+ * relocated hot core avoids the vecx_read8 dispatch CALL for them. via/io (which
+ * have read side effects) fall through to vecx_read8. matches vecx_read8 decode.
+ */
+static einline unsigned hot_read8 (unsigned address)
+{
+	unsigned a = address & 0xffff;
+
+	if (a < 0x8000) {
+		return cart[a];
+	}
+	if ((a & 0xe000) == 0xe000) {
+		return rom[a & 0x1fff];
+	}
+	if ((a & 0xe000) == 0xc000 && (a & 0x800)) {
+		return ram[a & 0x3ff];
+	}
+	return vecx_read8 (a);
+}
+
+/* operand write with the RAM-only region ($C800-$CFFF: bit 11 set, bit 12 clear
+ * = ram with no overlapping io) inlined; everything else (via/io/$D8xx ram+io)
+ * falls through to vecx_write8. matches vecx_write8 decode.
+ */
+static einline void hot_write8 (unsigned address, unsigned data)
+{
+	unsigned a = address & 0xffff;
+
+	if ((a & 0xe000) == 0xc000 && (a & 0x800) && !(a & 0x1000)) {
+		ram[a & 0x3ff] = (unsigned char)data;
+		return;
+	}
+	vecx_write8 (a, (unsigned char)data);
+}
+
 static einline unsigned hot_ea_direct (void)
 {
 	return (reg_dp << 8) | hot_pc_read8 ();
@@ -1528,10 +1561,9 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 	unsigned pc0;
 
 	if (irq_i == 0xabcdu) {
-		return 0x42u; /* relocated-entry exec probe */
+		return 0x42u;
 	}
 	if (irq_i == 0xabceu) {
-		/* probe: call ea_indexed from relocated code (postbyte from cart[0]) */
 		unsigned c = 0;
 		unsigned save = reg_pc;
 		unsigned ea;
@@ -1541,18 +1573,17 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 		return (ea & 0xff) + c + 0x100u;
 	}
 	if (irq_i == 0xabcfu) {
-		/* probe: write8 -> vecx_write8 (ram), read back */
 		write8 (0xc801u, 0xa5u);
-		return read8 (0xc801u) + 0x200u; /* expect 0xa5 + 0x200 = 0x2a5 */
+		return read8 (0xc801u) + 0x200u;
 	}
 	if (irq_i == 0xabd0u) {
-		return inst_sub8 (0x50u, 0x10u) + 0x300u; /* probe: inst_sub8 (0x40+0x300=0x340) */
+		return inst_sub8 (0x50u, 0x10u) + 0x300u;
 	}
 	if (irq_i == 0xabd1u) {
-		return (read8 (0xd000u) & 0xff) + 0x400u; /* probe: read8 of VIA reg */
+		return (read8 (0xd000u) & 0xff) + 0x400u;
 	}
 	if (irq_i == 0xabd2u) {
-		write8 (0xd00bu, 0x00u); /* probe: write8 of VIA reg (ACR) */
+		write8 (0xd00bu, 0x00u);
 		return 0x500u;
 	}
 
@@ -1611,7 +1642,7 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 				} else if (hi == 6) {
 					ea = ea_indexed (&cycles);
 				} else {
-					goto cold; /* hi==7 extended: cursed when relocated, fall back */
+					ea = hot_ea_extended (); /* hi == 7 extended */
 				}
 
 				if (low == 0xe) { /* jmp */
@@ -1619,15 +1650,15 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 					return cycles + (hi == 7 ? 4 : 3);
 				}
 				if (low == 0xd) { /* tst */
-					inst_tst8 (read8 (ea));
+					inst_tst8 (hot_read8 (ea));
 					return cycles + (hi == 7 ? 7 : 6);
 				}
 				if (low == 0xf) { /* clr */
 					inst_clr ();
-					write8 (ea, 0);
+					hot_write8 (ea, 0);
 					return cycles + (hi == 7 ? 7 : 6);
 				}
-				write8 (ea, hot_rmw (low, read8 (ea)));
+				hot_write8 (ea, hot_rmw (low, hot_read8 (ea)));
 				return cycles + (hi == 7 ? 7 : 6);
 			}
 		}
@@ -1650,24 +1681,26 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 			unsigned ea, operand, result;
 
 			if (low == 0x07) {
-				/* store: dir/idx inline, ext falls back (bisect) */
+				/* store: dir/idx/ext inline (no immediate mode) */
 				if (mode == 1) {
 					ea = hot_ea_direct (); cycles = 4;
 				} else if (mode == 2) {
 					ea = ea_indexed (&cycles); cycles += 4;
+				} else if (mode == 3) {
+					ea = hot_ea_extended (); cycles = 5;
 				} else {
-					goto cold;
+					goto cold; /* 0x87 / 0xc7 invalid */
 				}
-				write8 (ea, reg);
+				hot_write8 (ea, reg);
 				inst_tst8 (reg);
 				return cycles;
 			}
 
 			switch (mode) {
 			case 0: operand = hot_pc_read8 (); cycles = 2; break;
-			case 1: ea = hot_ea_direct (); operand = read8 (ea); cycles = 4; break;
-			case 2: ea = ea_indexed (&cycles); operand = read8 (ea); cycles += 4; break;
-			default: goto cold; /* bisect: fall back extended */
+			case 1: ea = hot_ea_direct (); operand = hot_read8 (ea); cycles = 4; break;
+			case 2: ea = ea_indexed (&cycles); operand = hot_read8 (ea); cycles += 4; break;
+			default: ea = hot_ea_extended (); operand = hot_read8 (ea); cycles = 5; break;
 			}
 
 			switch (low) {
@@ -1703,6 +1736,88 @@ unsigned VECX_ITCM e6809_hotcore (unsigned irq_i, unsigned irq_f)
 	case 0x2c: case 0x2d: return hot_bra8 (get_cc (FLAG_N) ^ get_cc (FLAG_V), op);
 	case 0x2e: case 0x2f: return hot_bra8 (get_cc (FLAG_Z) |
 						  (get_cc (FLAG_N) ^ get_cc (FLAG_V)), op);
+
+	/* stack / subroutine group (push/pull the emulated S/U stacks via write8/
+	 * read8). bodies match e6809_sstep exactly.
+	 */
+	case 0x17: { /* lbsr */
+		unsigned r = hot_pc_read16 ();
+		push16 (&reg_s, reg_pc);
+		reg_pc += r;
+		return 9;
+	}
+	case 0x8d: { /* bsr */
+		unsigned r = hot_pc_read8 ();
+		push16 (&reg_s, reg_pc);
+		reg_pc += sign_extend (r);
+		return 7;
+	}
+	case 0x9d: { /* jsr direct */
+		unsigned ea = hot_ea_direct ();
+		push16 (&reg_s, reg_pc);
+		reg_pc = ea;
+		return 7;
+	}
+	case 0xad: { /* jsr indexed */
+		unsigned cyc = 0;
+		unsigned ea = ea_indexed (&cyc);
+		push16 (&reg_s, reg_pc);
+		reg_pc = ea;
+		return cyc + 7;
+	}
+	case 0xbd: { /* jsr extended */
+		unsigned ea = hot_ea_extended ();
+		push16 (&reg_s, reg_pc);
+		reg_pc = ea;
+		return 8;
+	}
+	case 0x39: /* rts */
+		reg_pc = pull16 (&reg_s);
+		return 5;
+	case 0x34: { /* pshs */
+		unsigned cyc = 5;
+		inst_psh (hot_pc_read8 (), &reg_s, reg_u, &cyc);
+		return cyc;
+	}
+	case 0x35: { /* puls */
+		unsigned cyc = 5;
+		inst_pul (hot_pc_read8 (), &reg_s, &reg_u, &cyc);
+		return cyc;
+	}
+	case 0x36: { /* pshu */
+		unsigned cyc = 5;
+		inst_psh (hot_pc_read8 (), &reg_u, reg_s, &cyc);
+		return cyc;
+	}
+	case 0x37: { /* pulu */
+		unsigned cyc = 5;
+		inst_pul (hot_pc_read8 (), &reg_u, &reg_s, &cyc);
+		return cyc;
+	}
+
+	/* lea (indexed) + misc inherent ops */
+	case 0x30: { unsigned cyc = 0; reg_x = ea_indexed (&cyc); set_cc (FLAG_Z, test_z16 (reg_x)); return cyc + 4; }
+	case 0x31: { unsigned cyc = 0; reg_y = ea_indexed (&cyc); set_cc (FLAG_Z, test_z16 (reg_y)); return cyc + 4; }
+	case 0x32: { unsigned cyc = 0; reg_s = ea_indexed (&cyc); return cyc + 4; }
+	case 0x33: { unsigned cyc = 0; reg_u = ea_indexed (&cyc); return cyc + 4; }
+	case 0x3a: reg_x += reg_b & 0xff; return 3; /* abx */
+	case 0x3d: { /* mul */
+		unsigned r = (reg_a & 0xff) * (reg_b & 0xff);
+		set_reg_d (r);
+		set_cc (FLAG_Z, test_z16 (r));
+		set_cc (FLAG_C, (r >> 7) & 1);
+		return 11;
+	}
+	case 0x1a: reg_cc |= hot_pc_read8 (); return 3; /* orcc */
+	case 0x1c: reg_cc &= hot_pc_read8 (); return 3; /* andcc */
+	case 0x1d: /* sex */
+		set_reg_d (sign_extend (reg_b));
+		set_cc (FLAG_N, test_n (reg_a));
+		set_cc (FLAG_Z, test_z16 (get_reg_d ()));
+		return 2;
+	case 0x1e: inst_exg (); return 8; /* exg */
+	case 0x1f: inst_tfr (); return 6; /* tfr */
+
 	default:
 		break;
 	}

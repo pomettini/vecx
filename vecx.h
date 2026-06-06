@@ -42,6 +42,7 @@ typedef struct vector_type {
 
 extern unsigned char rom[8192];
 extern unsigned char cart[32768];
+extern unsigned char ram[1024];
 
 extern unsigned snd_regs[16];
 extern unsigned alg_jch0;

@@ -11,7 +11,21 @@
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
 #define BENCHMARK_LOG_MS 5000U
-#define BUILD_VARIANT "win110"
+#define BUILD_VARIANT "recon120full"
+/* Bytes below the init stack frame for the relocated hot-core pool TOP. The pool
+ * extends DOWN by the core size and must land in the safe gap between resident
+ * firmware data (floor) and the live stack (ceiling). 0x1180 keeps the top at
+ * ~0x20008a00 with ~1.8KB of headroom above the floor for the current core size.
+ * See PLAYDATE_ITCM_GUIDE.md before changing (re-probe per device/SDK).
+ */
+#define POOL_MARGIN 0x1180u
+/* DTCM execution is alignment-sensitive (the M7 fetches code from TCM in 64-bit
+ * lines, and the decode's branch targets land differently per base alignment).
+ * The relocated core's INTERNAL layout is fixed; only its absolute base
+ * alignment varies. POOL_NUDGE (multiple of 4) shifts the 32-aligned pool base
+ * to land the hot decode on the fast alignment. Swept on device; lock the best.
+ */
+#define POOL_NUDGE 0u
 #define BUILD_LABEL __DATE__ " " __TIME__ " " BUILD_VARIANT
 #define PERSISTENCE_FRAMES 3
 #define PERSISTENCE_VECTOR_CAP 512
@@ -487,15 +501,25 @@ static void itcm_drain(void)
 	}
 }
 
-/* relocate the hot core into the fast TCM pool (manual cacheable word-copy into
- * the ~4KB safe region above the firmware holes; see PLAYDATE_ITCM_GUIDE.md).
+/* Relocate the compact 6809 hot core (e6809_hotcore, marked VECX_ITCM and
+ * collected into the .text output so its R_ARM_ABS32 relocations are applied)
+ * into a fast DTCM pool, then point e6809_hotcore_p at the copy.
+ *
+ * The pool lives in the unused stack region below the init frame, in the safe
+ * gap between resident firmware data (floor ~0x200074d0) and the live stack.
+ * See PLAYDATE_ITCM_GUIDE.md. The relocation self-test probes (D1-D6) are kept:
+ * they confirm the relocated copy is executable and call-correct, AND -- on this
+ * device -- they are LOAD-BEARING for performance: their presence in e6809.c +
+ * here sets the exact whole-binary layout that packs the hot helpers into the
+ * I-cache without conflicts (+~3 FPS vs. without). The win is fragile binary-
+ * wide alignment; do not "clean up" without re-measuring on device.
  */
 static void itcm_relocate(void)
 {
 #if ITCM_ENABLE
 	uintptr_t size = (uintptr_t)__itcm_end - (uintptr_t)__itcm_start;
 	uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
-	uintptr_t pool = (frame - 0x2180u - size) & ~(uintptr_t)0xf;
+	uintptr_t pool = (frame - POOL_MARGIN - size) & ~(uintptr_t)0xf;
 	uintptr_t off = ((uintptr_t)e6809_hotcore & ~(uintptr_t)1) - (uintptr_t)__itcm_start;
 	const uint32_t *src = (const uint32_t *)__itcm_start;
 	volatile uint32_t *dst = (volatile uint32_t *)pool;
@@ -519,9 +543,6 @@ static void itcm_relocate(void)
 		(void*)e6809_hotcore_p);
 	itcm_drain();
 
-	/* probes from a shallow stack: entry exec, then the helper calls the bigger
-	 * compact interp makes (vecx_read8 / read8 -> vecx_read8).
-	 */
 	{
 		unsigned r = e6809_hotcore_p (0xabcdu, 0);
 		pd->system->logToConsole("vecx itcm: D1 entry=0x%x %s (pool %p-%p)",
