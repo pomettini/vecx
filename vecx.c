@@ -7,7 +7,12 @@
 #include "e8910.h"
 
 #define einline __inline
-#define VECX_FAST_BATCH 1
+/* FAST_BATCH must stay 0: batching the analog/VIA stepping over multiple cycles
+ * approximates the beam-ramp timing and mangles the font (strokes wrong length).
+ * WAIT_LOOP_SKIP is the big speed lever (skips the BIOS idle wait) and does NOT
+ * affect the beam, so keep it on.
+ */
+#define VECX_FAST_BATCH 0
 #define VECX_MACHINE_ADVANCE_BATCH 1
 #define VECX_WAIT_LOOP_SKIP 1
 #define VECX_BIOS_DELAY_SKIP 0

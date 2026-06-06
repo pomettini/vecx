@@ -19,7 +19,12 @@
 enum {
 	VECTREX_MHZ		= 1500000, /* speed of the vectrex being emulated */
 	VECTREX_UPDATE_HZ = 120,
-	VECTREX_RENDER_HZ = VECTREX_UPDATE_HZ,
+	/* render/phosphor rate: a full Vectrex screen redraw is ~50Hz (~30000
+	 * cycles). Rendering faster than this (it was = UPDATE_HZ = 120) reset the
+	 * vector list mid-redraw, so each frame only held ~42% of the screen's
+	 * strokes -> sparse/illegible text. 50 = one complete screen per render.
+	 */
+	VECTREX_RENDER_HZ = 50,
 	VECTREX_VECTOR_CAP = 768,
 	VECTREX_VECTOR_HASH = 1021,
 	VECTREX_COLORS  = 128,     /* number of possible colors ... grayscale */

@@ -15,7 +15,10 @@ endif
 
 VPATH += .
 
-SRC = playdate_main.c e6809.c e8910.c vecx.c
+# render.c is LAST on purpose: objects linked after e6809.o/vecx.o don't shift
+# them, so iterating on the renderer can't reshuffle the CPU hot path's I-cache
+# packing (the 38.2-FPS layout). See PLAYDATE_ITCM_GUIDE.md.
+SRC = playdate_main.c e6809.c e8910.c vecx.c render.c
 
 UINCDIR =
 UASRC =
