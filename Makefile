@@ -41,9 +41,13 @@ $(OBJDIR)/e6809.o: CPFLAGS += -mlong-calls -fno-lto
 
 PLAYDATE_GAMES ?= /Volumes/PLAYDATE/Games
 
+# Device-only project: never build the simulator (.dylib). `make` and `make
+# install` target the device; everything is tested on hardware.
+.DEFAULT_GOAL := device
+
 .PHONY: install _push
 
-install: all
+install: device
 	@test -d "$(PLAYDATE_GAMES)" || (echo "Playdate volume not mounted at $(PLAYDATE_GAMES)" && exit 1)
 	$(RM) -rf "$(PLAYDATE_GAMES)/$(PRODUCT)"
 	COPYFILE_DISABLE=1 cp -R "$(PRODUCT)" "$(PLAYDATE_GAMES)/"
