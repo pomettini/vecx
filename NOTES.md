@@ -343,3 +343,22 @@ Methodology lesson: when *every* rendering change leaves the output identical, s
 - System-menu **Rotation** item: `-90 / 0 / 90` (0 default) for left/upright/right; rotated modes transpose the content.
 - **FIT** scaling: fill the limiting screen axis keeping the Vectrex aspect ratio, bars on the other axis, no cropping.
 - Removed after they didn't pan out: crank zoom, 2x supersampling, the direct-framebuffer path, and the vector-length diagnostic. Persistence kept but `#if`-gated off (it doubles moving objects at the 50Hz render rate).
+
+### Recovering the FAST_BATCH cost without breaking the font (perf phase)
+
+Going per-cycle for a correct font cost ~22% (32 FPS vs the broken-font batched ~41). Recovered most of it by re-enabling `VECX_FAST_BATCH 1` and **capping each batch in `vecx_machine_advance` at the next beam-parameter change** (so the batched beam never spans a change it samples only once):
+
+1. Timer-1 PB7 toggle (flips the beam ramp = stroke length): cap `step` at `(via_t1c & 0xffff)` when `via_t1on && (via_acr & 0x80) && ((via_acr & 0x40) || via_t1int)`. The T1 period is a whole stroke, far longer than an instruction, so this almost never shortens a batch.
+2. Shift-register CB2 blank (beam on/off): `step = 1` while `(via_acr & 0x10) && via_srb < 8`. The SR is idle (batchable) most of the time; only the beam-on pulses pay per-cycle.
+
+**Result: 36 FPS with a correct, complete font** (`avg_vectors` ~465, same as the per-cycle build; the broken T1-cap-only build was 154). A further attempt to batch *inside* the SR window by predicting the next CB2 flip from the SR bit pattern **regressed to 32** — Mine Storm's blank flips too often, so the prediction loop costs more than the batched cycles buy. Reverted; `step = 1` is optimal. The remaining 36-vs-41 gap is irreducible: the beam-on pulses are genuinely per-cycle. Net for the perf phase: **32 -> 36 FPS (+12.5%) with the font intact.** Also added a runtime **Frameskip** menu (0/1/2) for render-side relief.
+
+### CPU side: profiled, and it's the wall (36 FPS is the ceiling)
+
+PC-sample profiler (`VECX_SAMPLE_PROFILE`) on Mine Storm gameplay: a light/idle regime (47-50 FPS, hot at the f4eb BIOS delay loop) and a **heavy game-logic loop at f33d-f347 / f425-f427 (30-32 FPS = the floor)** running opcodes 27/d5/97/26/d7/a6 — all already covered by the TCM hot core. Per-instruction cost is ~1800 host-cyc in *both* regimes; phases differ only in instruction *count*, so the heavy phase is irreducible real work.
+
+Two CPU levers tried, both lose:
+- `VECX_BIOS_DELAY_SKIP=1` (skip the hot f4eb loop): **regressed** (heavy 30-32→28, normal 36→34.5). The per-instruction `pc==0xf4eb` probe (a non-inlined `e6809_get_pc` call every instruction) costs more than the skip saves — the wait-skip only survives because its skipped region is huge.
+- **Force-inlining** the hot per-instruction helpers (`hot_pc_read8/read8/write8/ea_*/bra8` via `always_inline`): **neutral-to-slightly-negative**. objdump shows the core does ~84 `blx` into them, but they're small + I-cache-resident (cheap), and growing e6809.c (.itcm 3580→3944) reshuffled the fragile whole-binary I-cache packing.
+
+Conclusion: the DTCM hot core is already optimal; **36 FPS (correct font) is the architectural ceiling**, and the remaining ~3.5× to native is diffuse compute + D-cache that only a from-scratch dynarec could touch (still PSRAM-bound). Don't re-chase delay-skip or helper-inlining.

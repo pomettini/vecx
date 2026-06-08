@@ -1264,8 +1264,10 @@ static einline void vecx_machine_advance (unsigned cycles)
 
 		/* While the shift register is clocking out the CB2 blank (via_acr & 0x10,
 		 * via_srb < 8), the beam blank can flip every shift; step one cycle at a
-		 * time through that window so the batched beam sees the right blank. The
-		 * SR is idle (batchable) most of the time -- only the beam-on pulses pay. */
+		 * time through that window so the batched beam sees the right blank. (Trying
+		 * to batch inside the window by predicting the next blank flip regressed:
+		 * Mine Storm's pattern flips too often, so the prediction cost outweighs the
+		 * batched cycles. The SR is idle/batchable most of the time anyway.) */
 		if ((via_acr & 0x10) && via_srb < 8)
 			step = 1;
 
