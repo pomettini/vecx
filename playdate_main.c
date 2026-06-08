@@ -339,6 +339,15 @@ static void reset_benchmark(uint32_t now_ms)
 	vecx_sample_reset();
 }
 
+/* sound diagnostics: snd_regs is the AY register file (vecx.c); the dbg_* counters
+ * are bumped by the audio-thread callback (e8910.c). */
+extern unsigned snd_regs[16];
+extern volatile unsigned e8910_dbg_calls;
+extern volatile unsigned e8910_dbg_active; /* underrun samples */
+extern volatile int e8910_dbg_maxvol;
+extern volatile int e8910_dbg_ratio_x1000;
+extern unsigned e8910_ring_fill(void);
+
 static void maybe_log_benchmark(uint32_t now_ms)
 {
 	uint32_t elapsed_ms = now_ms - bench_window_start_ms;
@@ -396,6 +405,14 @@ static void maybe_log_benchmark(uint32_t now_ms)
 		(unsigned long)bench_total_delay_skips,
 		(unsigned long)bench_total_delay_skip_cycles,
 		(unsigned long)bench_skipped_frames);
+
+	pd->system->logToConsole(
+		"vecx snd: callbacks=%u underruns=%u ringfill=%u ratio=%d maxvol=%d volA=%u volB=%u volC=%u enable=0x%02x",
+		e8910_dbg_calls, e8910_dbg_active, e8910_ring_fill(), e8910_dbg_ratio_x1000, e8910_dbg_maxvol,
+		snd_regs[8], snd_regs[9], snd_regs[10], snd_regs[7]);
+	e8910_dbg_maxvol = 0;
+	e8910_dbg_calls = 0;
+	e8910_dbg_active = 0;
 
 	log_sample_profile();
 	reset_benchmark(now_ms);
@@ -538,6 +555,9 @@ static void start_emulation(void)
 	vecx_reset();
 	rom_picker_free();
 	pd->display->setInverted(1); /* Vectrex look: white vectors on black */
+	/* clear so the picker's last (black-on-white) frame isn't shown inverted for
+	 * one frame during the switch; white -> inverted -> a clean black frame */
+	pd->graphics->clear(kColorWhite);
 	reset_benchmark(pd->system->getCurrentTimeMilliseconds());
 	want_picker = 0;
 	picker_active = 0;
@@ -553,6 +573,9 @@ static void return_to_picker(void)
 	selected_rom[0] = '\0';
 	want_picker = 0;
 	pd->display->setInverted(0);
+	/* clear so the emulator's last (inverted) frame isn't shown for one frame
+	 * before the picker redraws; white -> non-inverted -> a clean white frame */
+	pd->graphics->clear(kColorWhite);
 	init_rom_picker();
 	picker_active = 1;
 }
@@ -582,6 +605,20 @@ static int update(void* userdata)
 
 	update_input();
 	vecx_emu(EMU_CYCLES_PER_UPDATE);
+
+	/* Keep the audio buffer topped up to a target each update, so playback is
+	 * smooth and at real pitch. The AY thus free-runs ahead of the (~30% speed)
+	 * emulation and register changes lag behind -- audible as distortion -- but
+	 * it never starves into noise, and generating here on the main thread (not the
+	 * audio thread) avoids the free-running corruption that caused the white noise. */
+	{
+		const int audio_target = 2048; /* ~46 ms buffered at 44100 */
+		int nsamp = audio_target - (int)e8910_ring_fill();
+
+		if (nsamp > 0)
+			e8910_generate(nsamp);
+	}
+
 	bench_total_emu_cycles += (uint32_t)vecx_emu_cycle_count;
 	bench_total_emu_instructions += (uint32_t)vecx_emu_instruction_count;
 	bench_total_wait_skips += (uint32_t)vecx_wait_skip_count;
@@ -611,17 +648,20 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 
 	if (event == kEventInit) {
 		pd = playdate;
+
+		/* add this first so "ROM Picker" is the top entry in the system menu */
+		pd->system->addMenuItem("ROM Picker", rompicker_menu_cb, NULL);
+
 		render_init(pd, pd->display->getWidth(), pd->display->getHeight());
 
 		pd->display->setRefreshRate((float)TARGET_FPS);
 		pd->system->setAutoLockDisabled(1);
 
 		load_bios();
-		e8910_init_sound();
+		e8910_init_sound(pd);
 		itcm_relocate();
 
 		init_rom_picker();
-		pd->system->addMenuItem("ROM Picker", rompicker_menu_cb, NULL);
 
 		pd->system->logToConsole("vecx: Playdate C build %s", BUILD_LABEL);
 		pd->system->setUpdateCallback(update, pd);
