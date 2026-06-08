@@ -162,7 +162,7 @@ static void rotation_menu_callback(void *userdata)
 
 /* render every (frame_skip + 1)th frame; the rest are skipped. Selected via menu. */
 static PDMenuItem *frameskip_item;
-static const char *frameskip_options[] = { "0", "1", "2" };
+static const char *frameskip_options[] = { "0", "1" };
 static int frame_skip;
 
 static void frameskip_menu_callback(void *userdata)

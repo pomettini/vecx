@@ -8,6 +8,7 @@
 #include "vecx.h"
 #include "e6809.h"
 #include "render.h"
+#include "rom_picker.h"
 
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
@@ -44,6 +45,96 @@ extern char __itcm_end[];
 #endif
 
 static PlaydateAPI* pd;
+
+/* Minimal snprintf for the ROM-picker submodule (it only formats "%s%s%s").
+ * Providing our own keeps newlib's vfprintf -> malloc chain out of the link --
+ * the device links no heap, and that chain is fragile here. Handles %s %c %d %u
+ * %x %%; returns the length that would be written, like the standard.
+ * DEVICE ONLY: the Mac simulator has a full libc (and treats snprintf as a
+ * fortify builtin), so there it uses the system snprintf. */
+#if !defined(TARGET_SIMULATOR)
+int snprintf(char* str, size_t size, const char* fmt, ...)
+{
+	va_list ap;
+	size_t pos = 0;   /* bytes placed (kept < size to leave room for NUL) */
+	size_t total = 0; /* bytes that would be written */
+	const char* f;
+	char num[16];
+
+	va_start(ap, fmt);
+	for (f = fmt; *f != '\0'; f++) {
+		if (*f != '%') {
+			if (pos + 1 < size) str[pos++] = *f;
+			total++;
+			continue;
+		}
+
+		switch (*++f) {
+		case 's': {
+			const char* s = va_arg(ap, const char*);
+			if (s == NULL)
+				s = "(null)";
+			for (; *s != '\0'; s++) {
+				if (pos + 1 < size) str[pos++] = *s;
+				total++;
+			}
+			break;
+		}
+		case 'c': {
+			char c = (char)va_arg(ap, int);
+			if (pos + 1 < size) str[pos++] = c;
+			total++;
+			break;
+		}
+		case 'd':
+		case 'u':
+		case 'x': {
+			unsigned base = (*f == 'x') ? 16u : 10u;
+			unsigned long v;
+			int neg = 0;
+			int n = 0;
+
+			if (*f == 'd') {
+				long sv = va_arg(ap, int);
+				if (sv < 0) { neg = 1; v = (unsigned long)(-sv); }
+				else v = (unsigned long)sv;
+			} else {
+				v = va_arg(ap, unsigned int);
+			}
+			do {
+				unsigned dig = (unsigned)(v % base);
+				num[n++] = (char)(dig < 10u ? '0' + dig : 'a' + dig - 10u);
+				v /= base;
+			} while (v != 0 && n < (int)sizeof(num));
+			if (neg) { if (pos + 1 < size) str[pos++] = '-'; total++; }
+			while (n-- > 0) {
+				if (pos + 1 < size) str[pos++] = num[n];
+				total++;
+			}
+			break;
+		}
+		case '%':
+			if (pos + 1 < size) str[pos++] = '%';
+			total++;
+			break;
+		case '\0':
+			f--; /* trailing '%': stop */
+			break;
+		default:
+			if (pos + 1 < size) str[pos++] = '%';
+			total++;
+			if (pos + 1 < size) str[pos++] = *f;
+			total++;
+			break;
+		}
+	}
+	va_end(ap);
+
+	if (size > 0)
+		str[pos] = '\0';
+	return (int)total;
+}
+#endif /* !TARGET_SIMULATOR */
 
 static uint32_t bench_window_start_ms;
 static uint32_t bench_update_count;
@@ -103,28 +194,25 @@ static unsigned int read_partial_file(const char* path, unsigned char* dst, unsi
 	return total;
 }
 
-static void load_roms(void)
+static void load_bios(void)
 {
 	if (!read_exact_file("rom.dat", rom, sizeof(rom)))
 		pd->system->error("Failed to load rom.dat from PDX data");
+}
+
+/* load a .vec cart from an absolute path (the ROM picker hands us the full path,
+ * e.g. /Shared/Emulation/vec/games/foo.vec). */
+static void load_cart(const char* path)
+{
+	unsigned int n;
 
 	memset(cart, 0, sizeof(cart));
+	n = read_partial_file(path, cart, sizeof(cart));
 
-	{
-		const char* cart_name = "cart.vec";
-		unsigned int cart_bytes = read_partial_file(cart_name, cart, sizeof(cart));
-
-		if (cart_bytes == 0) {
-			cart_name = "mine_storm.vec";
-			cart_bytes = read_partial_file(cart_name, cart, sizeof(cart));
-		}
-
-		if (cart_bytes > 0) {
-			pd->system->logToConsole("vecx: loaded %s (%u bytes)", cart_name, cart_bytes);
-		} else {
-			pd->system->logToConsole("vecx: no cart.vec or mine_storm.vec found; using BIOS only");
-		}
-	}
+	if (n > 0)
+		pd->system->logToConsole("vecx: loaded cart %s (%u bytes)", path, n);
+	else
+		pd->system->logToConsole("vecx: FAILED to load cart %s", path);
 }
 
 static void update_input(void)
@@ -410,6 +498,65 @@ static void itcm_relocate(void)
 #endif
 }
 
+/* ROM picker: at boot we show the picker; once a .vec is chosen we load it and
+ * switch to running the emulator. */
+static const char* rom_extensions[] = { "vec", NULL };
+static int picker_active = 1;
+static int want_picker = 0;
+static char selected_rom[ROM_PICKER_MAX_PATH];
+
+static void on_rom_picked(const char* path, void* userdata)
+{
+	(void)userdata;
+	strncpy(selected_rom, path, sizeof(selected_rom) - 1);
+	selected_rom[sizeof(selected_rom) - 1] = '\0';
+}
+
+static void init_rom_picker(void)
+{
+	RomPickerConfig cfg;
+
+	cfg.folder = "/Shared/Emulation/vec/games/";
+	cfg.extensions = rom_extensions;
+	cfg.on_select = on_rom_picked;
+	cfg.userdata = NULL;
+	cfg.auto_load_single = 1; /* one ROM -> skip the picker */
+	rom_picker_init(pd, &cfg);
+}
+
+/* system-menu "ROM Picker": request a return to the picker (done in update()). */
+static void rompicker_menu_cb(void* userdata)
+{
+	(void)userdata;
+	want_picker = 1;
+}
+
+static void start_emulation(void)
+{
+	load_cart(selected_rom);
+	memset(ram, 0, sizeof(ram)); /* fresh RAM for the new cart */
+	vecx_reset();
+	rom_picker_free();
+	pd->display->setInverted(1); /* Vectrex look: white vectors on black */
+	reset_benchmark(pd->system->getCurrentTimeMilliseconds());
+	want_picker = 0;
+	picker_active = 0;
+}
+
+/* back to the picker: wipe the machine's memory + reset everything, restore the
+ * picker's normal display, and rescan the ROM folder. */
+static void return_to_picker(void)
+{
+	memset(ram, 0, sizeof(ram));
+	memset(cart, 0, sizeof(cart));
+	vecx_reset();
+	selected_rom[0] = '\0';
+	want_picker = 0;
+	pd->display->setInverted(0);
+	init_rom_picker();
+	picker_active = 1;
+}
+
 static int update(void* userdata)
 {
 	uint32_t start_ms;
@@ -417,6 +564,19 @@ static int update(void* userdata)
 	PlaydateAPI* playdate = userdata;
 
 	(void)playdate;
+
+	if (picker_active) {
+		if (selected_rom[0] == '\0')
+			rom_picker_update();
+		if (selected_rom[0] != '\0')
+			start_emulation();
+		return 1;
+	}
+
+	if (want_picker) {
+		return_to_picker();
+		return 1;
+	}
 
 	start_ms = pd->system->getCurrentTimeMilliseconds();
 
@@ -454,14 +614,14 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		render_init(pd, pd->display->getWidth(), pd->display->getHeight());
 
 		pd->display->setRefreshRate((float)TARGET_FPS);
-		pd->display->setInverted(1);
 		pd->system->setAutoLockDisabled(1);
 
-		load_roms();
+		load_bios();
 		e8910_init_sound();
-		vecx_reset();
 		itcm_relocate();
-		reset_benchmark(pd->system->getCurrentTimeMilliseconds());
+
+		init_rom_picker();
+		pd->system->addMenuItem("ROM Picker", rompicker_menu_cb, NULL);
 
 		pd->system->logToConsole("vecx: Playdate C build %s", BUILD_LABEL);
 		pd->system->setUpdateCallback(update, pd);
