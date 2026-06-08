@@ -363,6 +363,16 @@ Two CPU levers tried, both lose:
 
 Conclusion: the DTCM hot core is already optimal; **36 FPS (correct font) is the architectural ceiling**, and the remaining ~3.5× to native is diffuse compute + D-cache that only a from-scratch dynarec could touch (still PSRAM-bound). Don't re-chase delay-skip or helper-inlining.
 
+### JIT (dynamic recompiler) — foundation built, in jit.c (linked LAST, FPS-safe)
+
+Decision: attempt a 6809→ARM JIT (the only lever with real headroom), built in milestones with a go/no-go gate. `jit.c` is its own TU linked last so it can't perturb the hot-core layout; a `jit_selftest(pd)` runs once in eventInit.
+
+- **M1 DONE — runtime codegen works.** Emitted `movs r0,#0x42; bx lr` into a static `uint16_t` buffer, `clearICache()`, called it via `(ptr|1)` (Thumb bit) → returned 0x42. The device executes code we generate at runtime. NOTE: the buffer landed in PSRAM (0x60000000), so JIT'd code is I-cache-bound just like the interpreter; for M3 to actually *beat* the DTCM hot core it likely needs the code buffer in DTCM (but the DTCM relocation pool is only ~2KB free) — an open question that decides the whole effort.
+- **M2 DONE — Thumb emitter + load/modify/store.** Minimal emitter (`emit_movs_imm8/ldrb/strb/adds_imm3/bx_lr`, low regs only); emitted `(*p)++` and verified (0x10→0x12). These primitives are the shape every 6809 register+memory op compiles to.
+- **M3 DONE — translator + go/no-go.** A 6809 kernel (loads/stores/AND, N/Z flags) translated to a native block, verified byte-exact vs a switch interpreter, then timed: **1.86× (177ms→95ms, both PSRAM)**. Real but optimistic (light kernel, naive reference); real ops + DTCM placement bring it down. User chose to commit to the full JIT.
+- **M4 DONE — full-flag ALU codegen (the biggest risk eliminated).** `ADDB #imm` with H/N/Z/V/C by branchless bit-math (Thumb-1 has no flag-read/IT). **Exhaustively verified 1280/1280** (5 imms × 256 b). The hard part — flags — is proven.
+- **M5+ NEXT (mechanical, large):** real memory ops (emit `bl read8/write8`) + addressing modes; branches + block discovery; block cache + **DTCM placement** (~2KB pool — the crux); `vecx_emu` integration with interpreter fallback; widen coverage + measure on real gameplay. All four hard unknowns (runtime codegen, emitter, translation, full flags) are now proven; the rest is build-out.
+
 ### Flicker fix: framebuffer phosphor decay (`PHOSPHOR_DECAY`, render.c)
 
 Vectrex games **multiplex** entities (draw some only every other frame to share beam time); real phosphor hides it, but rendering each frame hard at ~17 Hz made multiplexed/moving entities blink. Re-drawing old frames (the old `RENDER_PERSISTENCE`) fixed flicker but caused hard doubles. Fix: instead of clearing, **OR an alternating dither mask (`{0xAA,0x55}`) into the framebuffer** each render so un-redrawn pixels fade to white over ~2 frames, then draw the new vectors solid over it — phosphor emulation that hides the flicker and turns motion into a faint short glow, not a double. Cost is ~free (one framebuffer OR pass replacing the clear + `markUpdatedRows`); FPS stayed 36. A longer mask table = slower decay / longer glow if more smoothing is wanted.

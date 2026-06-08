@@ -8,6 +8,7 @@
 #include "vecx.h"
 #include "e6809.h"
 #include "render.h"
+#include "jit.h"
 
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
@@ -461,6 +462,7 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		e8910_init_sound();
 		vecx_reset();
 		itcm_relocate();
+		jit_selftest(pd);
 		reset_benchmark(pd->system->getCurrentTimeMilliseconds());
 
 		pd->system->logToConsole("vecx: Playdate C build %s", BUILD_LABEL);
