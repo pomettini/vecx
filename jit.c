@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "pd_api.h"
+#include "vecx.h"
 #include "jit.h"
 
 /* 6809 dynamic recompiler.
@@ -56,6 +57,29 @@ static void emit_adds_reg(jit_buf *b, unsigned rd, unsigned rn, unsigned rm)
 { emit16(b, 0x1800u | (rm << 6) | (rn << 3) | rd); }
 static void emit_mov_reg(jit_buf *b, unsigned rd, unsigned rm)
 { emit16(b, 0x0000u | (rm << 3) | rd); } /* lsls rd, rm, #0 */
+static void emit_uxtb(jit_buf *b, unsigned rd, unsigned rm)
+{ emit16(b, 0xb2c0u | (rm << 3) | rd); }
+static void emit_blx_reg(jit_buf *b, unsigned rm)
+{ emit16(b, 0x4780u | (rm << 3)); }
+
+/* Thumb-2 32-bit movw/movt (M7 supports them): load any 16-bit half into rd. */
+static void emit_movw(jit_buf *b, unsigned rd, unsigned imm16)
+{
+	emit16(b, 0xf240u | (((imm16 >> 11) & 1u) << 10) | ((imm16 >> 12) & 0xfu));
+	emit16(b, (((imm16 >> 8) & 7u) << 12) | (rd << 8) | (imm16 & 0xffu));
+}
+static void emit_movt(jit_buf *b, unsigned rd, unsigned imm16)
+{
+	emit16(b, 0xf2c0u | (((imm16 >> 11) & 1u) << 10) | ((imm16 >> 12) & 0xfu));
+	emit16(b, (((imm16 >> 8) & 7u) << 12) | (rd << 8) | (imm16 & 0xffu));
+}
+/* rd = 32-bit absolute addr (Thumb bit included); then blx rd. */
+static void emit_call_abs(jit_buf *b, unsigned rd, uintptr_t addr)
+{
+	emit_movw(b, rd, (unsigned)(addr & 0xffffu));
+	emit_movt(b, rd, (unsigned)((addr >> 16) & 0xffffu));
+	emit_blx_reg(b, rd);
+}
 static void emit_bx_lr(jit_buf *b)
 { emit16(b, 0x4770u); }
 static void emit_push_r456_lr(jit_buf *b)
@@ -210,6 +234,58 @@ static void jit_m3_benchmark(PlaydateAPI *pd)
 	}
 }
 
+/* ----------------------------------------- M5: DTCM placement (the crux) */
+/* Same kernel as M3, but emitted into a stack buffer (SRAM/DTCM at 0x20000000,
+ * the fast region the relocated hot core runs from) instead of the static buffer
+ * (PSRAM at 0x60000000). If DTCM is much faster, that's the path; it's also what a
+ * JIT block needs to beat the DTCM interpreter. */
+static void jit_m5_dtcm(PlaydateAPI *pd)
+{
+	uint16_t dtcm_code[256] __attribute__((aligned(8)));
+	jit_buf b;
+	void (*blk)(kcpu *);
+	kcpu ci, cj;
+	unsigned i, ok;
+	uint32_t t0, t1, t2;
+	const unsigned K = 200000u;
+
+	b.code = dtcm_code;
+	b.len = 0;
+	b.cap = sizeof(dtcm_code) / sizeof(dtcm_code[0]);
+	jit_translate_kernel(&b);
+	pd->system->clearICache();
+	blk = (void (*)(kcpu *))(((uintptr_t)dtcm_code) | 1u);
+
+	memset(&ci, 0, sizeof(ci));
+	memset(&cj, 0, sizeof(cj));
+	kinterp(&ci);
+	blk(&cj);
+	ok = (ci.a == cj.a && ci.b == cj.b && ci.cc == cj.cc &&
+		memcmp(ci.mem, cj.mem, sizeof(ci.mem)) == 0);
+
+	pd->system->logToConsole("vecx jit: M5 DTCM block at %p verify %s",
+		(void *)dtcm_code, ok ? "OK" : "BAD");
+	if (!ok)
+		return;
+
+	t0 = pd->system->getCurrentTimeMilliseconds();
+	for (i = 0; i < K; i++)
+		kinterp(&ci);
+	t1 = pd->system->getCurrentTimeMilliseconds();
+	for (i = 0; i < K; i++)
+		blk(&cj);
+	t2 = pd->system->getCurrentTimeMilliseconds();
+
+	{
+		uint32_t im = t1 - t0, jm = t2 - t1;
+		uint32_t rx = jm ? (im * 100u) / jm : 0u;
+
+		pd->system->logToConsole(
+			"vecx jit: M5 DTCM bench K=%u interp(PSRAM)=%ums jit(DTCM)=%ums speedup=%u.%02ux (cf jit-PSRAM was 95ms)",
+			K, (unsigned)im, (unsigned)jm, (unsigned)(rx / 100u), (unsigned)(rx % 100u));
+	}
+}
+
 /* ------------------------------------------------- M4: full-flag ADD codegen */
 /* CC: H=0x20 N=0x08 Z=0x04 V=0x02 C=0x01 */
 
@@ -318,6 +394,131 @@ static void jit_m4_addflags(PlaydateAPI *pd)
 		tested - fails, tested, fails == 0 ? "ALL OK" : "FAILS!");
 }
 
+/* --------------------------------------- M6: real memory ops (honest number) */
+/* Load/store kernel hitting the REAL vecx_read8/vecx_write8 (full address decode),
+ * so the per-op cost includes what the JIT can't eliminate. Registers a,cc live in
+ * callee-saved r4,r5 so the memory calls don't clobber them. op: 0=LDA 1=STA. */
+
+typedef struct { uint8_t a, cc; } kcpu6;
+
+typedef struct { uint8_t op; uint16_t addr; } kop6;
+static const kop6 m6prog[] = {
+	{ 0, 0xc850 }, { 1, 0xc851 }, { 0, 0xc852 },
+	{ 1, 0xc853 }, { 0, 0xc851 }, { 1, 0xc850 },
+};
+#define M6N (sizeof(m6prog) / sizeof(m6prog[0]))
+
+static void m6_init_mem(void)
+{
+	vecx_write8(0xc850u, 0x5au);
+	vecx_write8(0xc851u, 0x00u);
+	vecx_write8(0xc852u, 0x80u);
+	vecx_write8(0xc853u, 0x01u);
+}
+
+static void kinterp6(kcpu6 *c)
+{
+	unsigned i;
+
+	for (i = 0; i < M6N; i++) {
+		if (m6prog[i].op == 0)
+			c->a = vecx_read8(m6prog[i].addr);
+		else
+			vecx_write8(m6prog[i].addr, c->a);
+		c->cc = (uint8_t)((c->cc & ~0x0cu) | (c->a ? 0u : 0x04u) | ((c->a & 0x80u) ? 0x08u : 0u));
+	}
+}
+
+/* set N/Z in r5(cc) from r4(a); temps r0,r1 (caller-saved, free between calls) */
+static void emit_setnz6(jit_buf *b)
+{
+	emit_lsr_imm5(b, 0, 4, 4);
+	emit_movs_imm8(b, 1, 0x08u);
+	emit_ands(b, 0, 1);
+	emit_subs_imm3(b, 1, 4, 1);
+	emit_lsr_imm5(b, 1, 1, 31);
+	emit_lsl_imm5(b, 1, 1, 2);
+	emit_orrs(b, 0, 1);
+	emit_movs_imm8(b, 1, 0x0cu);
+	emit_bics(b, 5, 1);
+	emit_orrs(b, 5, 0);
+}
+
+/* r4=a, r5=cc, r6=state ; calls vecx_read8/write8 (preserve r4-r6) */
+static void jit_translate_m6(jit_buf *b)
+{
+	unsigned i;
+
+	emit_push_r456_lr(b);
+	emit_mov_reg(b, 6, 0);          /* r6 = state ptr */
+	emit_ldrb_imm(b, 4, 6, 0);      /* r4 = a  */
+	emit_ldrb_imm(b, 5, 6, 1);      /* r5 = cc */
+
+	for (i = 0; i < M6N; i++) {
+		if (m6prog[i].op == 0) {                 /* LDA addr */
+			emit_movw(b, 0, m6prog[i].addr);     /* r0 = addr */
+			emit_call_abs(b, 1, (uintptr_t)&vecx_read8);
+			emit_uxtb(b, 4, 0);                  /* a = (byte)result */
+		} else {                                 /* STA addr */
+			emit_movw(b, 0, m6prog[i].addr);     /* r0 = addr */
+			emit_mov_reg(b, 1, 4);               /* r1 = a (data) */
+			emit_call_abs(b, 2, (uintptr_t)&vecx_write8);
+		}
+		emit_setnz6(b);
+	}
+
+	emit_strb_imm(b, 4, 6, 0);
+	emit_strb_imm(b, 5, 6, 1);
+	emit_pop_r456_pc(b);
+}
+
+static void jit_m6_realmem(PlaydateAPI *pd)
+{
+	jit_buf b;
+	void (*blk)(kcpu6 *);
+	kcpu6 ci, cj;
+	unsigned i, ok;
+	uint32_t t0, t1, t2;
+	const unsigned K = 100000u;
+
+	b.code = jit_code;
+	b.len = 0;
+	b.cap = sizeof(jit_code) / sizeof(jit_code[0]);
+	jit_translate_m6(&b);
+	blk = (void (*)(kcpu6 *))jit_finalize(pd, &b);
+
+	memset(&ci, 0, sizeof(ci));
+	memset(&cj, 0, sizeof(cj));
+	m6_init_mem();
+	kinterp6(&ci);
+	m6_init_mem();
+	blk(&cj);
+	ok = (ci.a == cj.a && ci.cc == cj.cc);
+
+	pd->system->logToConsole(
+		"vecx jit: M6 realmem verify interp(a=%02x cc=%02x) jit(a=%02x cc=%02x) %s (%u hw)",
+		ci.a, ci.cc, cj.a, cj.cc, ok ? "OK" : "MISMATCH", b.len);
+	if (!ok)
+		return;
+
+	t0 = pd->system->getCurrentTimeMilliseconds();
+	for (i = 0; i < K; i++)
+		kinterp6(&ci);
+	t1 = pd->system->getCurrentTimeMilliseconds();
+	for (i = 0; i < K; i++)
+		blk(&cj);
+	t2 = pd->system->getCurrentTimeMilliseconds();
+
+	{
+		uint32_t im = t1 - t0, jm = t2 - t1;
+		uint32_t rx = jm ? (im * 100u) / jm : 0u;
+
+		pd->system->logToConsole(
+			"vecx jit: M6 realmem K=%u interp=%ums jit=%ums speedup=%u.%02ux (real vecx_read8/write8)",
+			K, (unsigned)im, (unsigned)jm, (unsigned)(rx / 100u), (unsigned)(rx % 100u));
+	}
+}
+
 void jit_selftest(PlaydateAPI *pd)
 {
 	jit_buf b;
@@ -355,4 +556,10 @@ void jit_selftest(PlaydateAPI *pd)
 
 	/* M4 */
 	jit_m4_addflags(pd);
+
+	/* M5 */
+	jit_m5_dtcm(pd);
+
+	/* M6 */
+	jit_m6_realmem(pd);
 }
