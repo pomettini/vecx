@@ -4,14 +4,19 @@
 #include "vecx.h"
 #include "render.h"
 
-/* Phosphor-glow trails. 0 = draw only the current (complete) frame: crisp.
- * 1 = overlay recent frames; looks doubled with the slow-mo 50Hz render rate,
- * so it's off by default.
- */
+/* Phosphor-glow trails by RE-DRAWING old frames. Superseded by PHOSPHOR_DECAY
+ * (cheaper, no doubling); kept off. */
 #define RENDER_PERSISTENCE 0
 #define PERSISTENCE_FRAMES 3
 #define PERSISTENCE_VECTOR_CAP 512
 #define VECTOR_LINE_WIDTH 1
+
+/* Phosphor decay: instead of clearing, fade old (black) pixels toward white with
+ * an alternating dither, so un-redrawn vectors vanish over (number of masks)
+ * frames -- faint in between. Emulates the Vectrex phosphor and hides the object-
+ * multiplex flicker, at ~no cost (one framebuffer OR pass replacing the clear,
+ * no re-drawing). Longer mask table = slower decay = longer glow. */
+#define PHOSPHOR_DECAY 1
 
 static PlaydateAPI* pd;
 static int screen_w = LCD_COLUMNS;
@@ -19,6 +24,13 @@ static int screen_h = LCD_ROWS;
 static int scale_factor = 1;
 static int offset_x = 0;
 static int offset_y = 0;
+
+#if PHOSPHOR_DECAY
+/* fade dither masks, cycled per frame; their OR covers every bit, so old pixels
+ * fully fade over (table length) frames. 2 entries ~= a 2-frame phosphor glow. */
+static const uint8_t phosphor_masks[] = { 0xAAu, 0x55u };
+static unsigned phosphor_phase;
+#endif
 
 #if RENDER_PERSISTENCE
 static vector_t persistence_vectors[PERSISTENCE_FRAMES][PERSISTENCE_VECTOR_CAP];
@@ -188,7 +200,22 @@ uint32_t render_draw_frame(void)
 {
 	uint32_t drawn_vectors = 0;
 
+#if PHOSPHOR_DECAY
+	{
+		uint8_t *frame = pd->graphics->getFrame();
+		uint8_t fade = phosphor_masks[phosphor_phase++ %
+			(sizeof(phosphor_masks) / sizeof(phosphor_masks[0]))];
+		int total = LCD_ROWSIZE * LCD_ROWS;
+		int i;
+
+		/* fade old black pixels toward white (1 = white); vectors re-drawn below
+		 * stay solid, un-redrawn ones dither out over the mask cycle. */
+		for (i = 0; i < total; i++)
+			frame[i] |= fade;
+	}
+#else
 	pd->graphics->clear(kColorWhite);
+#endif
 
 #if RENDER_PERSISTENCE
 	drawn_vectors += draw_persistence_frames();
@@ -196,6 +223,10 @@ uint32_t render_draw_frame(void)
 	drawn_vectors += draw_vector_list(vectors_draw, vector_draw_cnt);
 #if RENDER_PERSISTENCE
 	save_persistence_frame();
+#endif
+
+#if PHOSPHOR_DECAY
+	pd->graphics->markUpdatedRows(0, LCD_ROWS - 1);
 #endif
 
 	return drawn_vectors;

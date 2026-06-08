@@ -362,3 +362,7 @@ Two CPU levers tried, both lose:
 - **Force-inlining** the hot per-instruction helpers (`hot_pc_read8/read8/write8/ea_*/bra8` via `always_inline`): **neutral-to-slightly-negative**. objdump shows the core does ~84 `blx` into them, but they're small + I-cache-resident (cheap), and growing e6809.c (.itcm 3580→3944) reshuffled the fragile whole-binary I-cache packing.
 
 Conclusion: the DTCM hot core is already optimal; **36 FPS (correct font) is the architectural ceiling**, and the remaining ~3.5× to native is diffuse compute + D-cache that only a from-scratch dynarec could touch (still PSRAM-bound). Don't re-chase delay-skip or helper-inlining.
+
+### Flicker fix: framebuffer phosphor decay (`PHOSPHOR_DECAY`, render.c)
+
+Vectrex games **multiplex** entities (draw some only every other frame to share beam time); real phosphor hides it, but rendering each frame hard at ~17 Hz made multiplexed/moving entities blink. Re-drawing old frames (the old `RENDER_PERSISTENCE`) fixed flicker but caused hard doubles. Fix: instead of clearing, **OR an alternating dither mask (`{0xAA,0x55}`) into the framebuffer** each render so un-redrawn pixels fade to white over ~2 frames, then draw the new vectors solid over it — phosphor emulation that hides the flicker and turns motion into a faint short glow, not a double. Cost is ~free (one framebuffer OR pass replacing the clear + `markUpdatedRows`); FPS stayed 36. A longer mask table = slower decay / longer glow if more smoothing is wanted.
