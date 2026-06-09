@@ -548,6 +548,30 @@ static void rompicker_menu_cb(void* userdata)
 	want_picker = 1;
 }
 
+/* The system menu caps at 3 items, so one slot is shared: "ROM Picker" while
+ * playing (return to the picker), "Sound" while in the picker (arm audio before
+ * launching a game). Audio generation costs CPU, so sound is OFF by default and
+ * only toggleable from the picker. The menu is rebuilt on each transition so the
+ * swappable item stays first, followed by the renderer's Rotation/Frameskip. */
+static int sound_enabled;
+static PDMenuItem* sound_item;
+
+static void sound_menu_cb(void* userdata)
+{
+	(void)userdata;
+	sound_enabled = pd->system->getMenuItemValue(sound_item);
+}
+
+static void rebuild_menu(int in_picker)
+{
+	pd->system->removeAllMenuItems();
+	if (in_picker)
+		sound_item = pd->system->addCheckmarkMenuItem("Sound", sound_enabled, sound_menu_cb, NULL);
+	else
+		pd->system->addMenuItem("ROM Picker", rompicker_menu_cb, NULL);
+	render_refresh_menu();
+}
+
 static void start_emulation(void)
 {
 	load_cart(selected_rom);
@@ -561,6 +585,7 @@ static void start_emulation(void)
 	reset_benchmark(pd->system->getCurrentTimeMilliseconds());
 	want_picker = 0;
 	picker_active = 0;
+	rebuild_menu(0); /* gameplay: "ROM Picker" slot */
 }
 
 /* back to the picker: wipe the machine's memory + reset everything, restore the
@@ -578,6 +603,7 @@ static void return_to_picker(void)
 	pd->graphics->clear(kColorWhite);
 	init_rom_picker();
 	picker_active = 1;
+	rebuild_menu(1); /* picker: "Sound" slot */
 }
 
 static int update(void* userdata)
@@ -611,7 +637,7 @@ static int update(void* userdata)
 	 * emulation and register changes lag behind -- audible as distortion -- but
 	 * it never starves into noise, and generating here on the main thread (not the
 	 * audio thread) avoids the free-running corruption that caused the white noise. */
-	{
+	if (sound_enabled) {
 		const int audio_target = 2048; /* ~46 ms buffered at 44100 */
 		int nsamp = audio_target - (int)e8910_ring_fill();
 
@@ -649,9 +675,6 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 	if (event == kEventInit) {
 		pd = playdate;
 
-		/* add this first so "ROM Picker" is the top entry in the system menu */
-		pd->system->addMenuItem("ROM Picker", rompicker_menu_cb, NULL);
-
 		render_init(pd, pd->display->getWidth(), pd->display->getHeight());
 
 		pd->display->setRefreshRate((float)TARGET_FPS);
@@ -662,6 +685,7 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		itcm_relocate();
 
 		init_rom_picker();
+		rebuild_menu(1); /* boot into the picker: "Sound" + Rotation + Frameskip */
 
 		pd->system->logToConsole("vecx: Playdate C build %s", BUILD_LABEL);
 		pd->system->setUpdateCallback(update, pd);

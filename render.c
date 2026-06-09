@@ -182,18 +182,25 @@ void render_init(PlaydateAPI *playdate, int screen_width, int screen_height)
 	screen_w = screen_width;
 	screen_h = screen_height;
 
+	update_scaling();
+}
+
+/* (Re)add the renderer's Rotation + Frameskip menu items, preserving the current
+ * selections. The caller adds its own first item before calling this, so menu
+ * order survives a rebuild (see rebuild_menu in playdate_main.c). */
+void render_refresh_menu(void)
+{
 	rotation_item = pd->system->addOptionsMenuItem(
 		"Rotation", rotation_options,
 		(int)(sizeof(rotation_options) / sizeof(rotation_options[0])),
 		rotation_menu_callback, NULL);
-	pd->system->setMenuItemValue(rotation_item, ROT_NONE); /* default 0 degrees */
+	pd->system->setMenuItemValue(rotation_item, rotation);
 
 	frameskip_item = pd->system->addOptionsMenuItem(
 		"Frameskip", frameskip_options,
 		(int)(sizeof(frameskip_options) / sizeof(frameskip_options[0])),
-		frameskip_menu_callback, NULL); /* default index 0 = no frameskip */
-
-	update_scaling();
+		frameskip_menu_callback, NULL);
+	pd->system->setMenuItemValue(frameskip_item, frame_skip);
 }
 
 uint32_t render_draw_frame(void)

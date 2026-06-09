@@ -14,6 +14,11 @@
  */
 void render_init(PlaydateAPI *playdate, int screen_width, int screen_height);
 
+/* (re)add the renderer's Rotation + Frameskip system-menu items, preserving the
+ * current selections. Called after the caller adds its first menu item, so the
+ * 3-item menu can be rebuilt while keeping a stable order. */
+void render_refresh_menu(void);
+
 /* clear and draw the current frame's vectors (with the menu-selected rotation and
  * FIT scaling); returns the number of vectors drawn (for the benchmark).
  */
