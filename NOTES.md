@@ -459,6 +459,29 @@ Correctness-safe by construction: `vecx_machine_advance` still integrates the an
 
 **`f4eb` Print_Str delay skip — TRIED + REVERTED (third strike).** Folded the `f4eb` raster delay (`LDA #$81; NOP; DECB; BNE`, via `e6809_skip_bios_delay_f4eb`) into the unified probe, expecting the unified PC fetch to fix the builds-36/37 regression cause (a second per-instruction probe). The skip *worked* (title-screen instructions −28%, 2,100→1,500/update; gameplay −10%) but **wall time regressed ~1–1.5 FPS in every regime** (title 32.9→32.1, heavy 34.3–36.0→33.1–34.3, mid 39.6–41.0→37.6–39.3). The delay spin is I-cache-resident and nearly free, so there is no real win to offset the code-layout shift. Conclusion: **f4eb is structurally not worth skipping on this hardware — three independent attempts, three regressions. Do not retry.** Reverted to the T1-spin recognizer (code-identical to the measured iteration-1 build).
 
+### Adaptive speed (2026-06-11): per-scene cycle budget — light games approach native pacing
+
+The display caps updates at ~50 Hz, so the fixed 12,500-cycle budget topped out at **42% of the real 1.5 MHz machine** (~21 complete Vectrex frames/s) no matter how light the game — Rip-Off left the device >50% idle. Fix ([playdate_main.c](playdate_main.c), `adaptive_emu_cycles`): each update measures its wall time and a controller adjusts the next budget between 12,500 (the old floor) and 30,000 (`EMU_CYCLES_NATIVE` = true native pacing at 50 Hz), ±1,000/update. Budget resets on game switch; logged as `adaptive=` in the bench line.
+- **Controller lesson:** v1 compared the RAW per-update time against the thresholds and stalled near the floor — isolated 20–30 ms spikes (frame flips, the benchmark log itself) kept tripping the asymmetric fast back-off (−2,500 vs +500) while the average sat at 9–13 ms. v2 controls on an **EMA (~8-update horizon, ±1,000 symmetric, dead zone 15–16 ms)**: spikes are absorbed, only sustained load backs off.
+- **Measured (Rip-Off):** emulated speed 42% → **~57–61% of native** (emu_cycles 3.1M → 4.0–4.6M/window), real render rate ~21 → **25–31 fps**, updates pinned at ~16 ms = the genuine host-capacity equilibrium (full 30,000 would cost ~21 ms and miss the 50 Hz deadline). Heavy scenes (Mine Storm waves, boot screen) stay pinned at 12,500 = exactly the old behavior. User verdict: "the smoothest game I've ever played on any emulator on this device."
+- Side benefit: at higher emulated speed the AY register feed lags real time less, so sound distortion shrinks on light games.
+
+### D-pad follows screen rotation (2026-06-11)
+
+The D-pad mapping was hardwired to a transposed orientation (physical Right drove Vectrex Y-down — in Berzerk, moving right shot DOWN) and ignored the Rotation menu. `update_input` now reads `render_rotation()` (new accessor, render.c) and counter-rotates the physical direction into game space, so directions are screen-relative in all three orientations. Vectrex pot polarity: jch0 = X (0x00 left / 0xff right), jch1 = Y (0x00 down / 0xff up). Verified on device (Rip-Off).
+
+### Compatibility pass (2026-06-11): 5 games, no rendering issues
+
+| Game | Rendering | Speed | Notes |
+| --- | --- | --- | --- |
+| Mine Storm (built-in) | OK | 34–46 FPS | HLE validated bit-exact; the dev baseline |
+| Armor Attack (1982) | OK | ~30 FPS | maze = patterned lines (`Draw_Pat_VL`), the expensive path; HLE scale=48 clean. NB the game has an INVISIBLE-WALLS menu option (button 2) — not a bug |
+| Bedlam (1983) | OK | 35–39 FPS | logic-heavy (CPI ~1.5–2.5, 5–8k instr/update); HLE scale=4 clean |
+| Berzerk (1982) | OK | ~28 FPS | room walls = big scenery outside F410; slowest tested |
+| Rip-Off (1982) | OK | ~46–50 FPS, ~57–61% native pacing w/ adaptive | the light-game showcase |
+
+Takeaways: the F410 HLE generalizes (3 very different list shapes, zero artifacts, decline/fallback exercised); `Draw_Pat_VL`/`Draw_VL_mode` (dashed lines) never pass through F410 so they're structurally untouched by the HLE; the games that lag (~28–30 FPS) are the ones drawing big pattern/wall scenery — the remaining perf lever for them would be an HLE of `Draw_Pat_VL` (predict the dash on/off segments; same recipe, moderate effort, unscheduled).
+
 ### Performance verdict (2026-06-10, updated): HLE shipped ON; gameplay now 33-46 FPS
 
 The **1.3–1.6× generic-lever target is not reachable** with this SDK — the structural reason stands: **the game runs unprivileged (`CONTROL nPRIV=1`)**, so the only fast memory available is the SDK-mapped ~3.6 KB DTCM stack-pool. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are walled by that pool; ITCM (4× bigger) is forbidden by the sandbox; Tier 2b (wait-skip) is already optimal and regressed when touched.

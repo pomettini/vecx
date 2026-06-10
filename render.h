@@ -27,4 +27,8 @@ uint32_t render_draw_frame(void);
 /* menu-selected frameskip: 0 = render every frame, N = skip N frames between renders. */
 int render_frame_skip(void);
 
+/* menu-selected screen rotation in degrees: -90, 0 or 90. Input mapping uses it
+ * to counter-rotate the d-pad so directions stay screen-relative. */
+int render_rotation(void);
+
 #endif /* RENDER_H */

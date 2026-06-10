@@ -12,6 +12,17 @@
 
 #define TARGET_FPS VECTREX_UPDATE_HZ
 #define EMU_CYCLES_PER_UPDATE ((long)(VECTREX_MHZ / TARGET_FPS))
+/* Adaptive speed: the display caps updates at ~50 Hz, so the fixed 12,500-cycle
+ * budget tops out at ~42% of the real 1.5 MHz machine. When updates finish fast
+ * (light games / sparse scenes) grow the per-update budget toward 30,000 cycles
+ * = TRUE native pacing at 50 Hz; back off fast when the game gets heavy. Heavy
+ * regimes sit at the old floor (12,500) and behave exactly as before. */
+#define EMU_CYCLES_NATIVE ((long)(VECTREX_MHZ / VECTREX_RENDER_HZ))
+static long adaptive_emu_cycles = EMU_CYCLES_PER_UPDATE;
+/* EMA of update time (x16 fixed point). Controlling on the raw per-update time
+ * stalled near the floor: isolated 20-30 ms spikes (frame flips, logging) kept
+ * tripping the fast back-off while the average sat at 9-13 ms. */
+static long adaptive_ema_ms_x16;
 #define BENCHMARK_LOG_MS 5000U
 /* Keep this string a FIXED LENGTH (11 chars) and avoid editing playdate_main.c
  * for render work: its .rodata size feeds the whole-binary I-cache layout that
@@ -219,22 +230,37 @@ static void update_input(void)
 {
 	PDButtons current;
 	unsigned buttons = 0xff;
+	int px = 0, py = 0;  /* physical d-pad direction: +x right, +y up */
+	int gx, gy;          /* Vectrex joystick direction after counter-rotation */
+	int rot = render_rotation();
 
 	pd->system->getButtonState(&current, NULL, NULL);
 
-	if ((current & kButtonUp) && !(current & kButtonDown))
-		alg_jch0 = 0x00;
-	else if ((current & kButtonDown) && !(current & kButtonUp))
-		alg_jch0 = 0xff;
-	else
-		alg_jch0 = 0x80;
+	if (current & kButtonRight)
+		px += 1;
+	if (current & kButtonLeft)
+		px -= 1;
+	if (current & kButtonUp)
+		py += 1;
+	if (current & kButtonDown)
+		py -= 1;
 
-	if ((current & kButtonLeft) && !(current & kButtonRight))
-		alg_jch1 = 0xff;
-	else if ((current & kButtonRight) && !(current & kButtonLeft))
-		alg_jch1 = 0x00;
-	else
-		alg_jch1 = 0x80;
+	/* counter-rotate the physical direction into game space so the d-pad
+	 * always moves things the way it points on the (possibly rotated) screen */
+	if (rot < 0) {        /* content rotated -90 (CCW): game right = screen up */
+		gx = py;
+		gy = -px;
+	} else if (rot > 0) { /* content rotated +90 (CW): game right = screen down */
+		gx = -py;
+		gy = px;
+	} else {              /* upright */
+		gx = px;
+		gy = py;
+	}
+
+	/* Vectrex pots: jch0 = X (0x00 left, 0xff right), jch1 = Y (0x00 down, 0xff up) */
+	alg_jch0 = gx > 0 ? 0xff : gx < 0 ? 0x00 : 0x80;
+	alg_jch1 = gy > 0 ? 0xff : gy < 0 ? 0x00 : 0x80;
 
 	if (current & kButtonA)
 		buttons &= ~0x04U;
@@ -448,7 +474,7 @@ static void maybe_log_benchmark(uint32_t now_ms)
 		: 0;
 
 	pd->system->logToConsole(
-		"vecx bench build=\"%s\" window_ms=%lu updates=%lu renders=%lu avg_fps=%lu.%02lu avg_render_fps=%lu.%02lu avg_update_ms=%lu.%02lu avg_render_ms=%lu.%02lu min_update_ms=%lu max_update_ms=%lu emu_cycles=%lu emu_instr=%lu avg_instr_update=%lu.%02lu avg_cpi=%lu.%02lu avg_vectors=%lu.%02lu wait_skips=%lu wait_skip_cycles=%lu delay_skips=%lu delay_skip_cycles=%lu skipped=%lu",
+		"vecx bench build=\"%s\" window_ms=%lu updates=%lu renders=%lu avg_fps=%lu.%02lu avg_render_fps=%lu.%02lu avg_update_ms=%lu.%02lu avg_render_ms=%lu.%02lu min_update_ms=%lu max_update_ms=%lu emu_cycles=%lu emu_instr=%lu avg_instr_update=%lu.%02lu avg_cpi=%lu.%02lu avg_vectors=%lu.%02lu wait_skips=%lu wait_skip_cycles=%lu delay_skips=%lu delay_skip_cycles=%lu skipped=%lu adaptive=%ld",
 		BUILD_LABEL,
 		(unsigned long)elapsed_ms,
 		(unsigned long)bench_update_count,
@@ -475,7 +501,8 @@ static void maybe_log_benchmark(uint32_t now_ms)
 		(unsigned long)bench_total_wait_skip_cycles,
 		(unsigned long)bench_total_delay_skips,
 		(unsigned long)bench_total_delay_skip_cycles,
-		(unsigned long)bench_skipped_frames);
+		(unsigned long)bench_skipped_frames,
+		adaptive_emu_cycles);
 
 	pd->system->logToConsole(
 		"vecx snd: callbacks=%u underruns=%u ringfill=%u ratio=%d maxvol=%d volA=%u volB=%u volC=%u enable=0x%02x",
@@ -649,6 +676,8 @@ static void start_emulation(void)
 	load_cart(selected_rom);
 	memset(ram, 0, sizeof(ram)); /* fresh RAM for the new cart */
 	vecx_reset();
+	adaptive_emu_cycles = EMU_CYCLES_PER_UPDATE; /* re-learn the new game's load */
+	adaptive_ema_ms_x16 = 0;
 	rom_picker_free();
 	pd->display->setInverted(1); /* Vectrex look: white vectors on black */
 	/* clear so the picker's last (black-on-white) frame isn't shown inverted for
@@ -702,7 +731,7 @@ static int update(void* userdata)
 	start_ms = pd->system->getCurrentTimeMilliseconds();
 
 	update_input();
-	vecx_emu(EMU_CYCLES_PER_UPDATE);
+	vecx_emu(adaptive_emu_cycles);
 
 	/* Keep the audio buffer topped up to a target each update, so playback is
 	 * smooth and at real pitch. The AY thus free-runs ahead of the (~30% speed)
@@ -725,6 +754,26 @@ static int update(void* userdata)
 	bench_total_delay_skip_cycles += (uint32_t)vecx_delay_skip_cycles;
 
 	elapsed_ms = pd->system->getCurrentTimeMilliseconds() - start_ms;
+
+	/* adaptive-speed controller on the SMOOTHED update time (EMA, ~8-update
+	 * horizon): sustained headroom grows the budget, sustained load shrinks
+	 * it, single spikes are absorbed. 50 Hz = 20 ms/frame deadline; dead zone
+	 * 15-16 ms gives hysteresis. */
+	adaptive_ema_ms_x16 += ((long)elapsed_ms * 16 - adaptive_ema_ms_x16) / 8;
+	{
+		long ema_ms = adaptive_ema_ms_x16 / 16;
+
+		if (ema_ms <= 14 && adaptive_emu_cycles < EMU_CYCLES_NATIVE) {
+			adaptive_emu_cycles += 1000;
+			if (adaptive_emu_cycles > EMU_CYCLES_NATIVE)
+				adaptive_emu_cycles = EMU_CYCLES_NATIVE;
+		} else if (ema_ms >= 17 && adaptive_emu_cycles > EMU_CYCLES_PER_UPDATE) {
+			adaptive_emu_cycles -= 1000;
+			if (adaptive_emu_cycles < EMU_CYCLES_PER_UPDATE)
+				adaptive_emu_cycles = EMU_CYCLES_PER_UPDATE;
+		}
+	}
+
 	bench_update_count++;
 	bench_total_update_ms += elapsed_ms;
 	if (elapsed_ms < bench_min_update_ms)

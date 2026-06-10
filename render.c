@@ -176,6 +176,11 @@ int render_frame_skip(void)
 	return frame_skip;
 }
 
+int render_rotation(void)
+{
+	return rotation == ROT_LEFT ? -90 : rotation == ROT_RIGHT ? 90 : 0;
+}
+
 void render_init(PlaydateAPI *playdate, int screen_width, int screen_height)
 {
 	pd = playdate;
