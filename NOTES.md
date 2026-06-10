@@ -447,6 +447,18 @@ On a decline nothing executed and no cycles advanced, so the loop re-entered the
 
 **Lesson.** The watchdog signature said "host C code stopped making progress," which points at the *hook/loop plumbing*, not the emulated machine. The bisection burned ~12 device cycles varying the emulation (emission, cycle accounting, guards) when the one thing every freeze shared — the decline path — was never under test. When an intercept has a fallback contract ("return 0 → caller runs the real thing"), verify the caller actually honors it.
 
+### Unified BIOS-spin skip (2026-06-10): wait-skip extended to the T1 draw spins (+1-1.5 FPS) and the Print_Str delay
+
+Extending HLE coverage turned out NOT to need new intercepts: disassembly (tools/dis6809.py) showed the remaining hot loops are all the same `BITA/BITB <$0D; BEQ self` IFR poll that the proven `f19e` recognizer (build 62) already handles, just at other PCs with the mask in B instead of A. The recognizer ([vecx.c:1552](vecx.c#L1552)) now matches:
+- `f19e` Wait_Recal frame wait (mask in A) — the original;
+- `f33d`/`f345` **Moveto_d T1 spins** (mask in B) — every entity Movetos before drawing; this was the hot `f300` window (18–30% of samples);
+- `f3f4` Draw_VLcs T1 spin (other carts);
+- `f425` Mov_Draw_VL's internal spin — covers the F410 HLE's *decline* fallback path;
+Correctness-safe by construction: `vecx_machine_advance` still integrates the analog beam over the skipped cycles (strokes land exactly); only the CPU spin is collapsed.
+**Measured (T1-spin step, device):** heavy-wave `wait_skips` went 0–50 → ~2,400–3,000/window, executed instructions −12% (513–536k → 450–464k/window), FPS 33.4–35.4 → **34.3–36.0** heavy / **39.6–41.0** mid (~+1–1.5 FPS on top of the HLE). Rendering identical, no crashes. The gain is diluted because spin instructions are I-cache-cheap.
+
+**`f4eb` Print_Str delay skip — TRIED + REVERTED (third strike).** Folded the `f4eb` raster delay (`LDA #$81; NOP; DECB; BNE`, via `e6809_skip_bios_delay_f4eb`) into the unified probe, expecting the unified PC fetch to fix the builds-36/37 regression cause (a second per-instruction probe). The skip *worked* (title-screen instructions −28%, 2,100→1,500/update; gameplay −10%) but **wall time regressed ~1–1.5 FPS in every regime** (title 32.9→32.1, heavy 34.3–36.0→33.1–34.3, mid 39.6–41.0→37.6–39.3). The delay spin is I-cache-resident and nearly free, so there is no real win to offset the code-layout shift. Conclusion: **f4eb is structurally not worth skipping on this hardware — three independent attempts, three regressions. Do not retry.** Reverted to the T1-spin recognizer (code-identical to the measured iteration-1 build).
+
 ### Performance verdict (2026-06-10, updated): HLE shipped ON; gameplay now 33-46 FPS
 
 The **1.3–1.6× generic-lever target is not reachable** with this SDK — the structural reason stands: **the game runs unprivileged (`CONTROL nPRIV=1`)**, so the only fast memory available is the SDK-mapped ~3.6 KB DTCM stack-pool. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are walled by that pool; ITCM (4× bigger) is forbidden by the sandbox; Tier 2b (wait-skip) is already optimal and regressed when touched.

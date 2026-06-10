@@ -1561,12 +1561,34 @@ static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles)
 		return 0;
 	}
 
+	/* All the BIOS IFR poll spins (BITA/BITB <$0d; BEQ self) by PC:
+	 *   f19e  Wait_Recal frame wait        BITA, mask in A (usually $20, T2)
+	 *   f33d  Moveto_d T1 spin (long move) BITB, mask in B ($40, T1)
+	 *   f345  Moveto_d T1 spin (short)     BITB, mask in B
+	 *   f3f4  Draw_VLcs T1 spin            BITB, mask in B
+	 *   f425  Mov_Draw_VL T1 spin (runs when the F410 HLE declines) BITB, B
+	 * Skipping is exact: vecx_machine_advance still integrates the analog beam
+	 * over the skipped cycles, only the CPU spin is collapsed. */
 	pc = e6809_get_pc ();
-	if (pc != 0xf19e || e6809_get_dp () != 0xd0) {
+	if (pc == 0xf19e) {
+		poll_mask = e6809_get_a () & 0xff;
+	}
+	else if (pc == 0xf33d || pc == 0xf345 || pc == 0xf3f4 || pc == 0xf425) {
+		poll_mask = e6809_get_b () & 0xff;
+	}
+	else {
+		/* NOT here: the f4eb Print_Str delay (LDA #$81; NOP; DECB; BNE). It was
+		 * folded into this probe (2026-06-10) and REGRESSED ~1-1.5 FPS in every
+		 * regime despite cutting executed instructions 10-28%: the spin is
+		 * I-cache-resident and nearly free, so there's no real win to offset
+		 * the code-layout shift. Third strike (builds 36/37 regressed via the
+		 * standalone probe). Do not retry. */
 		return 0;
 	}
 
-	poll_mask = e6809_get_a () & 0xff;
+	if (e6809_get_dp () != 0xd0) {
+		return 0;
+	}
 	if (poll_mask == 0 || (via_ifr & poll_mask) != 0) {
 		return 0;
 	}
