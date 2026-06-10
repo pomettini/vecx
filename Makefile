@@ -15,9 +15,12 @@ endif
 
 VPATH += .
 
-# render.c / jit.c are LAST on purpose: objects linked after e6809.o/vecx.o don't
-# shift them, so iterating on the renderer/JIT can't reshuffle the CPU hot path's
-# I-cache packing (the 38.2-FPS layout). See PLAYDATE_ITCM_GUIDE.md.
+# LINK ORDER IS LOAD-BEARING (whole-binary I-cache packing, see PLAYDATE_ITCM_GUIDE.md).
+# The CPU hot path (e6809.o + vecx.o) is acutely position-sensitive: moving it FIRST
+# measured ~10% WORSE (Jun 10 2026), proving hand-tuning the layout is a dead end.
+# render.c / jit.c stay LAST (don't shift the core); this order is the better-measured
+# one of the two samples. The real fix is Tier 1 (hot path fully in DTCM -> packing-
+# independent), after which this order stops mattering.
 # rom_picker_unit.c #includes the pd-rom-picker submodule source via UINCDIR.
 SRC = playdate_main.c e6809.c e8910.c vecx.c render.c jit.c rom_picker_unit.c
 
@@ -37,6 +40,9 @@ LDFLAGS += -flto
 # build 92: .itcm section for runtime relocation of the hot core into fast TCM.
 override LDSCRIPT = ./link_map.ld
 # e6809.c -mlong-calls (relocated hot core's calls reach the originals) + -fno-lto.
+# e6809.c: -mlong-calls so the relocated hot core's calls reach the PSRAM originals.
+# (Tier 1 helper-relocation was tried + REVERTED: mechanism worked, but hot_core
+# 2968B + ea_indexed 1416B = 4.4KB overruns the ~3.6KB safe DTCM pool. See NOTES.md.)
 $(OBJDIR)/e6809.o: CPFLAGS += -mlong-calls -fno-lto
 
 PLAYDATE_GAMES ?= /Volumes/PLAYDATE/Games

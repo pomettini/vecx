@@ -1422,6 +1422,9 @@ void vecx_emu (long cycles)
 			skip_cycles = vecx_try_skip_ifr_wait (cycles);
 		}
 #else
+		/* Probe EVERY instruction: gating it (every 8th) measured -6.5% because the
+		 * Wait_Recal IFR-poll loop is often short and the missed short waits cost
+		 * far more than the per-instruction e6809_get_pc() probe. Leave it as-is. */
 		skip_cycles = vecx_try_skip_ifr_wait (cycles);
 #endif
 

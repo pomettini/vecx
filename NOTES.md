@@ -377,3 +377,26 @@ Decision: attempt a 6809→ARM JIT (the only lever with real headroom), built in
 ### Flicker fix: framebuffer phosphor decay (`PHOSPHOR_DECAY`, render.c)
 
 Vectrex games **multiplex** entities (draw some only every other frame to share beam time); real phosphor hides it, but rendering each frame hard at ~17 Hz made multiplexed/moving entities blink. Re-drawing old frames (the old `RENDER_PERSISTENCE`) fixed flicker but caused hard doubles. Fix: instead of clearing, **OR an alternating dither mask (`{0xAA,0x55}`) into the framebuffer** each render so un-redrawn pixels fade to white over ~2 frames, then draw the new vectors solid over it — phosphor emulation that hides the flicker and turns motion into a faint short glow, not a double. Cost is ~free (one framebuffer OR pass replacing the clear + `markUpdatedRows`); FPS stayed 36. A longer mask table = slower decay / longer glow if more smoothing is wanted.
+
+### Sound: AY-3-8910 (e8910.c, restored from git) + a Sound toggle
+
+The Playdate port had stubbed `e8910.c`; recovered the full MAME-based AY core from history (`git show bbd8314:e8910.c`) and replaced the SDL backend with `pd->sound->addSource` (44100 Hz, int16, mono). Findings: (1) **init hang** — the source fires before the game programs any register, so all periods are 0 and the envelope/noise loops spin forever; fixed by seeding `Period*`/`Count* = 1` and `Holding = 1`. (2) The **distortion was the ~30%-real-time emulation**, not the output stage — a clean test tone proved playback is fine. At 30% speed you can't have smooth + clean + correct-pitch together; per the user we keep **smooth + correct-pitch and accept distortion**. (3) **"White noise after a while" = the audio thread free-running** ahead of the lagging register feed; fixed by generating on the **main thread**. Architecture: `e8910_generate(n)` tops a SPSC int16 ring up to ~2048 samples each update (DC-block + gain 8), the audio callback drains it 1:1 (hold-last on underrun).
+
+### Sound toggle (off by default) — CPU saver
+
+Audio generation costs CPU we want for emulation, so **Sound is OFF by default**. The 3-item system menu shares one slot: **"Sound"** (checkbox) while in the picker, **"ROM Picker"** while playing — rebuilt on each transition (`rebuild_menu` + `render_refresh_menu`) so the swappable item stays first and Rotation/Frameskip keep their values. When off, `e8910_generate` is skipped each update.
+
+### Performance plan (forward, 2026-06-10): aim +1.3–1.6× (≈36 → 47–58 FPS)
+
+Native (3.3×) is out — it needs custom TCM linking the SDK loader blocks. The wall is memory latency (~2000 host-cyc/instr, ~7–8 PSRAM misses each); only **fast-memory placement** and **executing fewer instructions** help.
+
+- **Tier 0 (done):** audio off by default; frameskip exists.
+- **Tier 1 — TRIED + REVERTED (blocked by the DTCM pool size).** Relocate `ea_indexed` (the only hot out-of-line callee) into the cluster: drop `-mlong-calls` so the hot core's call to it is PC-relative and moves with the cluster, route the real out-calls (`vecx_read8/write8`, `e6809_sstep`, `inst_psh/pul/exg/tfr`) through **volatile** fn pointers. **The mechanism worked — D1–D6 all passed**, objdump confirmed the cluster self-contained. But the cluster is `hot_core 2968B + ea_indexed 1416B = 4432B`, and the safe DTCM region is only **~3.6 KB** (measured: size 3600 runs the whole baseline; size 4432 crashes *during* emulation — boot D-probes pass because they run before the clobbered DTCM is used). The whole safe region is smaller than the cluster, so no margin tweak helps; shrinking the hot core to fit would push RMW ops to PSRAM (net-neutral), and the payoff was already uncertain (helpers are I-cache-cheap). **Verdict: the ~3.6 KB pool is the hard wall — `ea_indexed` relocation is infeasible.** The layout lottery stands.
+- **Tier 2a (fuller compact core):** blocked by the same ~3.6 KB pool wall (the core already fills it).
+- **Tier 2b (more wait-skip) — TRIED + REVERTED:** the `Wait_Recal` IFR-poll probe already runs every instruction; gating it to every 8th measured **−6.5%** (wait_skips 84→35 — the wait loop is often short, so missed short waits cost more than the probe). The per-instruction probe is already optimal.
+- **Tier 3 (coarser VIA batching):** untried; `MACHINE_ADVANCE_BATCH` must stay 1 for font correctness, so the per-instruction analog step (already FAST_BATCH event-capped) has little headroom.
+- **Dead ends (don't revisit):** JIT (0.56×), page-table memory model, threaded dispatch, flag micro-opts, `-Os`, per-opcode switch fast paths, helper-relocation (pool wall), wait-skip gating (−6.5%).
+
+### Performance verdict (2026-06-10): ~33 FPS is the practical ceiling
+
+The **1.3–1.6× target is not reachable** with this SDK. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are both walled by the ~3.6 KB DTCM pool; Tier 2b (wait-skip) is already optimal and regressed when touched. The heavy Mine Storm regime (~33 FPS) is the **memory-bound real-game-work floor** the assessment predicted. Banked wins stand (TCM hot core +15% over the 33.2 baseline, FAST_BATCH font fix, render decouple, phosphor flicker fix, audio + ROM picker as features). Stopped here.
