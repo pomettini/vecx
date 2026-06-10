@@ -1155,6 +1155,31 @@ unsigned e6809_get_dp (void)
 	return reg_dp & 0xff;
 }
 
+unsigned e6809_get_b (void)
+{
+	return reg_b & 0xff;
+}
+
+unsigned e6809_get_x (void)
+{
+	return reg_x & 0xffff;
+}
+
+unsigned e6809_get_u (void)
+{
+	return reg_u & 0xffff;
+}
+
+void e6809_set_x (unsigned v)
+{
+	reg_x = v & 0xffff;
+}
+
+void e6809_set_pc (unsigned v)
+{
+	reg_pc = v & 0xffff;
+}
+
 unsigned e6809_skip_bios_delay_f4eb (unsigned max_cycles)
 {
 	unsigned iterations;

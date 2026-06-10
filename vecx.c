@@ -18,8 +18,16 @@
 #define VECX_MACHINE_ADVANCE_BATCH 1
 #define VECX_WAIT_LOOP_SKIP 1
 #define VECX_BIOS_DELAY_SKIP 0
-#define VECX_SAMPLE_PROFILE 0
+#define VECX_SAMPLE_PROFILE 0   /* HLE scoping rig (region split + BIOS buckets); flip to 1 to profile */
 #define VECX_SAMPLE_INTERVAL 64
+/* HLE milestone 2: active F410 intercept (Mov_Draw_VL). Works + renders correctly
+ * at +17-25%, but skipping the routine desyncs a BIOS timer/state interaction that
+ * occasionally FREEZES the game (watchdog reset) after sustained play -- confirmed
+ * via crashlog.txt (watchdog, not a fault). Cause localized to the timing path
+ * (emission ruled out by bisection) but not fully fixed. EXPERIMENTAL: off by
+ * default; set to 1 to use it (accepting the occasional freeze). See NOTES.md. */
+#define VECX_HLE_ACTIVE 0
+#define VECX_HLE_CAPTURE 0      /* shadow capture/validator (set 1 + ACTIVE 0 to re-validate geometry) */
 
 unsigned char rom[8192];
 unsigned char cart[32768];
@@ -125,6 +133,8 @@ unsigned long vecx_sample_total;
 unsigned long vecx_sample_opcode_counts[VECX_SAMPLE_OPCODES];
 unsigned vecx_sample_pc_addr[VECX_SAMPLE_PC_SLOTS];
 unsigned long vecx_sample_pc_count[VECX_SAMPLE_PC_SLOTS];
+unsigned long vecx_sample_region[VECX_SAMPLE_REGIONS];
+unsigned long vecx_sample_bios_bucket[VECX_SAMPLE_BIOS_BUCKETS];
 
 static int16_t vector_hash[VECTOR_HASH];
 
@@ -138,6 +148,8 @@ void vecx_sample_reset (void)
 	memset (vecx_sample_opcode_counts, 0, sizeof (vecx_sample_opcode_counts));
 	memset (vecx_sample_pc_addr, 0, sizeof (vecx_sample_pc_addr));
 	memset (vecx_sample_pc_count, 0, sizeof (vecx_sample_pc_count));
+	memset (vecx_sample_region, 0, sizeof (vecx_sample_region));
+	memset (vecx_sample_bios_bucket, 0, sizeof (vecx_sample_bios_bucket));
 }
 
 static einline void vecx_sample_record (unsigned pc)
@@ -149,6 +161,20 @@ static einline void vecx_sample_record (unsigned pc)
 
 	vecx_sample_total++;
 	vecx_sample_opcode_counts[opcode & 0xff]++;
+
+	/* HLE scoping: which region is this PC in, and (for BIOS) which routine? */
+	{
+		unsigned p = pc & 0xffffu;
+		if (p < 0x8000u)
+			vecx_sample_region[0]++;            /* cart ROM (game code) */
+		else if (p >= 0xc800u && p < 0xd000u)
+			vecx_sample_region[1]++;            /* Vectrex RAM */
+		else if (p >= 0xe000u) {
+			vecx_sample_region[2]++;            /* BIOS ROM */
+			vecx_sample_bios_bucket[(p - 0xe000u) >> 8]++;
+		} else
+			vecx_sample_region[3]++;            /* VIA / unmapped / other */
+	}
 
 	for (slot = 0; slot < VECX_SAMPLE_PC_SLOTS; slot++) {
 		if (vecx_sample_pc_count[slot] == 0) {
@@ -171,6 +197,193 @@ static einline void vecx_sample_record (unsigned pc)
 	vecx_sample_pc_addr[min_slot] = pc & 0xffff;
 	vecx_sample_pc_count[min_slot] = 1;
 }
+
+/* HLE of Mine Storm's hot draw loop (Mov_Draw_VL list walk at F410: per 3-byte
+ * entry [mode, dy, dx], spins on the T1 timer at F425, loops via F42E, exits to
+ * F430 -> $F34F; stroke scale = T1 low latch via_t1ll/$D004). VECX_HLE_CAPTURE
+ * shadow-validates the derived geometry; VECX_HLE_ACTIVE intercepts the loop. */
+#define HLE_ENTRY_PC 0xf410u
+#define HLE_EXIT_PC  0xf430u
+#define HLE_PRED_MAX 128
+
+/* globals are always defined so playdate_main's logging/reset link regardless
+ * of which HLE mode is compiled in. */
+unsigned long vecx_hle_calls, vecx_hle_tot_count, vecx_hle_tot_cyc, vecx_hle_tot_vec;
+unsigned vecx_hle_s_count, vecx_hle_s_listx, vecx_hle_s_list[6];
+long vecx_hle_s_cyc, vecx_hle_s_vec, vecx_hle_s_sx, vecx_hle_s_sy;
+long vecx_hle_s_v[2][5];
+int vecx_hle_s_valid;
+unsigned long vecx_hle_ok, vecx_hle_cntmiss, vecx_hle_geommiss;
+int vecx_hle_mm_valid;
+long vecx_hle_mm_idx, vecx_hle_mm_npred, vecx_hle_mm_nreal;
+long vecx_hle_mm_p[4], vecx_hle_mm_r[4];
+int vecx_hle_enabled = 1;            /* gated by VECX_HLE_ACTIVE (compile flag) */
+unsigned long vecx_hle_exec_calls;  /* F410 calls HLE'd this window */
+unsigned long vecx_hle_max_scale, vecx_hle_max_ent;  /* diagnostics */
+
+void vecx_hle_reset (void)
+{
+	vecx_hle_calls = vecx_hle_tot_count = vecx_hle_tot_cyc = vecx_hle_tot_vec = 0;
+	vecx_hle_ok = vecx_hle_cntmiss = vecx_hle_geommiss = 0;
+	vecx_hle_s_valid = 0;
+	vecx_hle_mm_valid = 0;
+	vecx_hle_exec_calls = 0;
+	vecx_hle_max_scale = 0;
+	vecx_hle_max_ent = 0;
+}
+
+#if VECX_HLE_CAPTURE
+static int hle_active;
+static unsigned hle_count0, hle_listx;
+static unsigned long hle_cyc0;
+static long hle_vcnt0, hle_sx, hle_sy;
+/* shadow prediction (derived geometry): x0,y0,x1,y1,color per emitted vector. */
+static long hle_pred[HLE_PRED_MAX][5];
+static int hle_npred;
+
+/* Predict the vectors the F410 loop will emit, from the snapshot state, using
+ * the geometry derived from the ground-truth capture:
+ *   per 3-byte entry [mode, dyb, dxb]; terminate when (signed)mode > 0;
+ *   dx = dxb_signed * scale, dy = -dyb_signed * scale;
+ *   mode==0 -> "move": a dot at the new position; else "draw": a line. */
+static void vecx_hle_predict (void)
+{
+	unsigned x = hle_listx;
+	long cx = hle_sx, cy = hle_sy;
+	long color = (long) alg_zsh;
+	long scale = (long) via_t1ll;
+
+	hle_npred = 0;
+	for (;;) {
+		int mode = (int) (signed char) vecx_peek8 (x);
+		long dyb, dxb, ex, ey;
+
+		if (mode > 0)
+			break;                          /* positive mode = list terminator */
+
+		dyb = (long) (signed char) vecx_peek8 (x + 1);
+		dxb = (long) (signed char) vecx_peek8 (x + 2);
+		x += 3;
+		ex = cx + dxb * scale;
+		ey = cy - dyb * scale;
+
+		if (hle_npred < HLE_PRED_MAX) {
+			long *p = hle_pred[hle_npred];
+			if (mode == 0) {                /* move: dot at the new position */
+				p[0] = ex; p[1] = ey; p[2] = ex; p[3] = ey;
+			} else {                        /* draw: line to the new position */
+				p[0] = cx; p[1] = cy; p[2] = ex; p[3] = ey;
+			}
+			p[4] = color;
+		}
+		hle_npred++;
+		cx = ex; cy = ey;
+		if (hle_npred >= HLE_PRED_MAX)
+			break;
+	}
+}
+
+static einline void vecx_hle_capture (unsigned pc, unsigned long cyc)
+{
+	if (!hle_active) {
+		if (pc == HLE_ENTRY_PC && e6809_get_dp () == 0xd0u) {
+			hle_active = 1;
+			hle_count0 = via_t1ll;            /* stroke scale ($D004 latch) */
+			hle_listx = e6809_get_x ();
+			hle_cyc0 = cyc;
+			hle_vcnt0 = vector_draw_cnt;
+			hle_sx = alg_curr_x;
+			hle_sy = alg_curr_y;
+			vecx_hle_predict ();             /* shadow: predict, do NOT mutate state */
+		}
+		return;
+	}
+
+	if (pc == HLE_EXIT_PC) {
+		long dv = vector_draw_cnt - hle_vcnt0;
+		long ip = 0, ir = 0;
+		int geom_ok = 1;
+
+		hle_active = 0;
+		vecx_hle_calls++;
+		vecx_hle_tot_count += hle_count0;
+		vecx_hle_tot_cyc += (cyc - hle_cyc0);
+		vecx_hle_tot_vec += (dv > 0 ? (unsigned long) dv : 0ul);
+
+		/* ---- dual-path diff, comparing only the VISIBLE lines ----
+		 * The real alg path emits zero-length junction dots between drawn lines
+		 * (invisible). Skip degenerate (x0==x1 && y0==y1) vectors on both sides
+		 * and compare the remaining lines two-pointer style. */
+		for (;;) {
+			vector_t *rv;
+			long *p;
+
+			while (ip < hle_npred &&
+				   hle_pred[ip][0] == hle_pred[ip][2] &&
+				   hle_pred[ip][1] == hle_pred[ip][3])
+				ip++;
+			while (ir < dv &&
+				   vectors_draw[hle_vcnt0 + ir].x0 == vectors_draw[hle_vcnt0 + ir].x1 &&
+				   vectors_draw[hle_vcnt0 + ir].y0 == vectors_draw[hle_vcnt0 + ir].y1)
+				ir++;
+
+			if (ip >= hle_npred && ir >= dv)
+				break;                        /* both exhausted -> match */
+			if (ip >= hle_npred || ir >= dv) {
+				geom_ok = 0;                  /* one side has extra lines */
+				vecx_hle_cntmiss++;
+				break;
+			}
+
+			p = hle_pred[ip];
+			rv = &vectors_draw[hle_vcnt0 + ir];
+			if (p[0] != rv->x0 || p[1] != rv->y0 ||
+				p[2] != rv->x1 || p[3] != rv->y1) {
+				geom_ok = 0;
+				if (!vecx_hle_mm_valid) {     /* capture the first mismatch */
+					vecx_hle_mm_valid = 1;
+					vecx_hle_mm_idx = ip;
+					vecx_hle_mm_npred = hle_npred;
+					vecx_hle_mm_nreal = dv;
+					vecx_hle_mm_p[0] = p[0]; vecx_hle_mm_p[1] = p[1];
+					vecx_hle_mm_p[2] = p[2]; vecx_hle_mm_p[3] = p[3];
+					vecx_hle_mm_r[0] = rv->x0; vecx_hle_mm_r[1] = rv->y0;
+					vecx_hle_mm_r[2] = rv->x1; vecx_hle_mm_r[3] = rv->y1;
+				}
+				break;
+			}
+			ip++; ir++;
+		}
+		if (geom_ok)
+			vecx_hle_ok++;
+		else
+			vecx_hle_geommiss++;
+
+		if (!vecx_hle_s_valid && dv > 0) {
+			int k;
+			vecx_hle_s_valid = 1;
+			vecx_hle_s_count = hle_count0;
+			vecx_hle_s_listx = hle_listx;
+			vecx_hle_s_cyc = (long) (cyc - hle_cyc0);
+			vecx_hle_s_vec = dv;
+			vecx_hle_s_sx = hle_sx;
+			vecx_hle_s_sy = hle_sy;
+			for (k = 0; k < 6; k++)
+				vecx_hle_s_list[k] = vecx_peek8 (hle_listx + k);
+			for (k = 0; k < 2; k++) {
+				long idx = hle_vcnt0 + k;
+				if (k < dv) {
+					vecx_hle_s_v[k][0] = vectors_draw[idx].x0;
+					vecx_hle_s_v[k][1] = vectors_draw[idx].y0;
+					vecx_hle_s_v[k][2] = vectors_draw[idx].x1;
+					vecx_hle_s_v[k][3] = vectors_draw[idx].y1;
+					vecx_hle_s_v[k][4] = vectors_draw[idx].color;
+				}
+			}
+		}
+	}
+}
+#endif
 
 /* update the snd chips internal registers when via_ora/via_orb changes */
 
@@ -1399,6 +1612,123 @@ static einline unsigned vecx_try_skip_bios_delay (long remaining_cycles)
 
 #endif
 
+#if VECX_HLE_ACTIVE
+/* Active HLE of the Mov_Draw_VL list loop at F410. Emit the vectors directly
+ * from the geometry proven bit-exact by the shadow validator (dx = dx*scale,
+ * dy = -dy*scale, scale = via_t1ll), so there's no dependence on the analog
+ * sample-and-hold timing (which made the earlier replicate-the-VIA approach
+ * glitch). Bounds-check first and fall back to the real routine for any vector
+ * that leaves the screen box (those need alg's exact per-cycle clipping). Then
+ * advance the VIA timers / sound / frame by an estimated cycle count with the
+ * beam blanked so nothing re-emits. Returns cycles consumed; PC/X advance to the
+ * F430 exit. Returns 0 (no HLE) to decline -- the real routine then runs. */
+static unsigned vecx_hle_f410_exec (void)
+{
+	unsigned x0 = e6809_get_x ();
+	long scale = (long) via_t1ll;
+	long sx = alg_curr_x, sy = alg_curr_y, color = (long) alg_zsh;
+	unsigned x, total = 0;
+	int guard;
+	long cx, cy;
+
+	if (scale == 0)
+		return 0;                           /* degenerate; let the real routine run */
+	if (sx < 0 || sx >= ALG_MAX_X || sy < 0 || sy >= ALG_MAX_Y)
+		return 0;                           /* beam off-screen; real routine clips */
+
+	/* The BIOS loop ALWAYS processes the first entry (it's entered at F410), then
+	 * checks each SUBSEQUENT entry's mode for the terminator (F42E BLE: continue
+	 * while the next mode <= 0). So the structure is process-entry, then peek-next:
+	 * stop when the next mode > 0 (that terminator entry is not drawn). */
+
+	/* pass 1: bounds-check; decline (-> real routine) if any endpoint is OOB. */
+	x = x0; cx = sx; cy = sy; guard = 0;
+	for (;;) {
+		long ex = cx + (long) (signed char) vecx_peek8 (x + 2) * scale;
+		long ey = cy - (long) (signed char) vecx_peek8 (x + 1) * scale;
+
+		x += 3;
+		if (ex < 0 || ex >= ALG_MAX_X || ey < 0 || ey >= ALG_MAX_Y)
+			return 0;
+		cx = ex; cy = ey;
+		if ((int) (signed char) vecx_peek8 (x) > 0)
+			break;                          /* next entry is the terminator */
+		if (++guard > 48)
+			return 0;                       /* unusually long list -> real routine */
+	}
+
+	/* If this call's cycles would cross a frame boundary, decline (-> real
+	 * routine) so vecx_finish_vector_frame / osint_render never fires from inside
+	 * the intercept. guard+1 ~ entry count; per entry ~ setup(65) + spin(scale). */
+	if (fcycles < (long) ((guard + 1) * (scale + 80)))
+		return 0;
+
+	/* pass 2: emit the exact predicted lines (mode==0 is a blanked move). */
+	x = x0; cx = sx; cy = sy; guard = 0;
+	for (;;) {
+		int mode = (int) (signed char) vecx_peek8 (x);
+		long ex = cx + (long) (signed char) vecx_peek8 (x + 2) * scale;
+		long ey = cy - (long) (signed char) vecx_peek8 (x + 1) * scale;
+
+		x += 3;
+		if (mode != 0)
+			alg_addline (cx, cy, ex, ey, (unsigned char) color);
+		cx = ex; cy = ey;
+		if ((int) (signed char) vecx_peek8 (x) > 0)
+			break;
+		if (++guard > 48)
+			break;
+	}
+	alg_curr_x = cx; alg_curr_y = cy;
+	alg_vectoring = 0;
+	if ((unsigned long) scale > vecx_hle_max_scale)
+		vecx_hle_max_scale = (unsigned long) scale;
+	if ((unsigned long) (guard + 1) > vecx_hle_max_ent)
+		vecx_hle_max_ent = (unsigned long) (guard + 1);
+
+	/* pass 3: timing. The real loop RESTARTS Timer-1 every entry (CLR $D005),
+	 * so leaving T1 mid-countdown desyncs the BIOS frame logic. Replicate the
+	 * per-entry restart so T1 ends exactly where the routine would. Force the
+	 * blank signals + shift register idle so machine_advance emits nothing (no
+	 * need to touch $D00A, which would re-clock the SR); restore them after. */
+	{
+		unsigned s_cb2s = via_cb2s, s_cb2h = via_cb2h, s_srb = via_srb;
+
+		via_cb2s = 0; via_cb2h = 0; via_srb = 8;   /* blanked, SR idle */
+		x = x0; guard = 0;
+		for (;;) {
+			unsigned dur;
+
+			x += 3;
+			/* Account for the ~65 cycles of per-entry setup instructions the real
+			 * loop runs (LDD/STA/CLR/.../BLE) BEFORE the timer spin -- otherwise the
+			 * cycle total runs short and the BIOS frame timer desyncs, eventually
+			 * freezing the game (watchdog). Advance them with the beam blanked. */
+			vecx_machine_advance (65u);
+			total += 65u;
+			vecx_write8 (0xd005u, 0x00u);   /* restart T1 from its latch */
+			dur = vecx_cycles_until_ifr_mask (0x40u);
+			if (dur == 0u)
+				dur = 1u;
+			vecx_machine_advance (dur);
+			total += dur;
+			if ((int) (signed char) vecx_peek8 (x) > 0)
+				break;
+			if (++guard > 100)
+				break;
+		}
+		via_cb2s = s_cb2s; via_cb2h = s_cb2h; via_srb = s_srb;
+	}
+	alg_curr_x = cx; alg_curr_y = cy;       /* undo any blanked-beam drift */
+	alg_vectoring = 0;
+
+	e6809_set_x (x);                        /* X points at the terminator entry */
+	e6809_set_pc (0xf430u);                 /* resume at F430 (JMP $F34F) */
+	vecx_hle_exec_calls++;
+	return total;
+}
+#endif
+
 void vecx_emu (long cycles)
 {
 	unsigned icycles;
@@ -1456,6 +1786,20 @@ void vecx_emu (long cycles)
 #if VECX_SAMPLE_PROFILE
 		if ((instruction_count & (VECX_SAMPLE_INTERVAL - 1U)) == 0) {
 			vecx_sample_record (e6809_get_pc ());
+		}
+#endif
+
+#if VECX_HLE_CAPTURE
+		vecx_hle_capture (e6809_get_pc (), cycle_count);
+#endif
+
+#if VECX_HLE_ACTIVE
+		if (vecx_hle_enabled && e6809_get_pc () == 0xf410u &&
+			e6809_get_dp () == 0xd0u) {
+			unsigned hc = vecx_hle_f410_exec ();
+			cycle_count += hc;
+			cycles -= (long) hc;
+			continue;
 		}
 #endif
 

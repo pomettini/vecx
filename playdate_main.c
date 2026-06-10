@@ -317,6 +317,75 @@ static void log_sample_profile(void)
 		pc_counts[3],
 		pc_values[4],
 		pc_counts[4]);
+
+	/* HLE scoping: region split (is BIOS worth replacing?) + hottest BIOS
+	 * 256-byte windows (which routines dominate). */
+	{
+		unsigned bk_values[SAMPLE_LOG_TOP] = { 0 };
+		unsigned long bk_counts[SAMPLE_LOG_TOP] = { 0 };
+		unsigned long rcart = vecx_sample_region[0];
+		unsigned long rram  = vecx_sample_region[1];
+		unsigned long rbios = vecx_sample_region[2];
+		unsigned long roth  = vecx_sample_region[3];
+		unsigned long tot   = vecx_sample_total ? vecx_sample_total : 1;
+
+		for (i = 0; i < VECX_SAMPLE_BIOS_BUCKETS; i++)
+			sample_insert_top(0xe000u + (i << 8), vecx_sample_bios_bucket[i],
+				bk_values, bk_counts);
+
+		pd->system->logToConsole(
+			"vecx region samples=%lu cart=%lu(%lu%%) ram=%lu bios=%lu(%lu%%) other=%lu | bios_top=%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu",
+			vecx_sample_total,
+			rcart, (rcart * 100ul) / tot,
+			rram,
+			rbios, (rbios * 100ul) / tot,
+			roth,
+			bk_values[0], bk_counts[0],
+			bk_values[1], bk_counts[1],
+			bk_values[2], bk_counts[2],
+			bk_values[3], bk_counts[3],
+			bk_values[4], bk_counts[4]);
+	}
+}
+
+/* HLE milestone-1: dump the ground-truth capture of the F3DD BIOS draw loop.
+ * Per window: how many draw calls, and avg vectors/cycles each (the spec a
+ * native intercept must reproduce). Plus one full sample: the list bytes, the
+ * beam start, and the first 2 emitted vectors (to derive the geometry). */
+static void log_hle_capture(void)
+{
+	unsigned long c = vecx_hle_calls ? vecx_hle_calls : 1;
+
+	if (vecx_hle_exec_calls != 0) {
+		pd->system->logToConsole(
+			"vecx hle-active: HLE'd %lu F410 calls, max_scale=%lu max_ent=%lu (enabled=%d)",
+			vecx_hle_exec_calls, vecx_hle_max_scale, vecx_hle_max_ent, vecx_hle_enabled);
+		return;
+	}
+
+	if (vecx_hle_calls == 0)
+		return;
+
+	pd->system->logToConsole(
+		"vecx hle: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu avg_vec=%lu (F410 shadow-validate)",
+		vecx_hle_calls, vecx_hle_ok, vecx_hle_cntmiss, vecx_hle_geommiss,
+		vecx_hle_tot_vec / c);
+
+	if (vecx_hle_mm_valid)
+		pd->system->logToConsole(
+			"vecx hle-MISMATCH: i=%ld npred=%ld nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
+			vecx_hle_mm_idx, vecx_hle_mm_npred, vecx_hle_mm_nreal,
+			vecx_hle_mm_p[0], vecx_hle_mm_p[1], vecx_hle_mm_p[2], vecx_hle_mm_p[3],
+			vecx_hle_mm_r[0], vecx_hle_mm_r[1], vecx_hle_mm_r[2], vecx_hle_mm_r[3]);
+	else if (vecx_hle_s_valid)
+		pd->system->logToConsole(
+			"vecx hle-sample: scale=%u vec=%ld listX=%04x list=%02x,%02x,%02x,%02x,%02x,%02x start=(%ld,%ld) v0=(%ld,%ld)->(%ld,%ld) v1=(%ld,%ld)->(%ld,%ld)",
+			vecx_hle_s_count, vecx_hle_s_vec, vecx_hle_s_listx,
+			vecx_hle_s_list[0], vecx_hle_s_list[1], vecx_hle_s_list[2],
+			vecx_hle_s_list[3], vecx_hle_s_list[4], vecx_hle_s_list[5],
+			vecx_hle_s_sx, vecx_hle_s_sy,
+			vecx_hle_s_v[0][0], vecx_hle_s_v[0][1], vecx_hle_s_v[0][2], vecx_hle_s_v[0][3],
+			vecx_hle_s_v[1][0], vecx_hle_s_v[1][1], vecx_hle_s_v[1][2], vecx_hle_s_v[1][3]);
 }
 
 static void reset_benchmark(uint32_t now_ms)
@@ -337,6 +406,7 @@ static void reset_benchmark(uint32_t now_ms)
 	bench_min_update_ms = UINT32_MAX;
 	bench_max_update_ms = 0;
 	vecx_sample_reset();
+	vecx_hle_reset();
 }
 
 /* sound diagnostics: snd_regs is the AY register file (vecx.c); the dbg_* counters
@@ -415,6 +485,7 @@ static void maybe_log_benchmark(uint32_t now_ms)
 	e8910_dbg_active = 0;
 
 	log_sample_profile();
+	log_hle_capture();
 	reset_benchmark(now_ms);
 }
 

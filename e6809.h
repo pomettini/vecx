@@ -8,6 +8,11 @@ extern unsigned (*e6809_hotcore_p) (unsigned irq_i, unsigned irq_f);
 unsigned e6809_get_pc (void);
 unsigned e6809_get_a (void);
 unsigned e6809_get_dp (void);
+unsigned e6809_get_b (void);
+unsigned e6809_get_x (void);
+unsigned e6809_get_u (void);
+void e6809_set_x (unsigned v);
+void e6809_set_pc (unsigned v);
 unsigned e6809_skip_bios_delay_f4eb (unsigned max_cycles);
 
 #endif

@@ -30,6 +30,10 @@ enum {
 	VECTREX_COLORS  = 128,     /* number of possible colors ... grayscale */
 	VECX_SAMPLE_OPCODES = 256,
 	VECX_SAMPLE_PC_SLOTS = 32,
+	/* HLE scoping: split sampled PCs by memory region, and bucket BIOS
+	 * (0xE000-0xFFFF, 8KB) into 256-byte windows to localize hot routines. */
+	VECX_SAMPLE_REGIONS = 4,        /* cart, ram, bios, other */
+	VECX_SAMPLE_BIOS_BUCKETS = 32,  /* (0xFFFF-0xE000+1)/256 */
 
 	ALG_MAX_X		= 33000,
 	ALG_MAX_Y		= 41000
@@ -69,6 +73,23 @@ extern unsigned long vecx_sample_total;
 extern unsigned long vecx_sample_opcode_counts[VECX_SAMPLE_OPCODES];
 extern unsigned vecx_sample_pc_addr[VECX_SAMPLE_PC_SLOTS];
 extern unsigned long vecx_sample_pc_count[VECX_SAMPLE_PC_SLOTS];
+extern unsigned long vecx_sample_region[VECX_SAMPLE_REGIONS];
+extern unsigned long vecx_sample_bios_bucket[VECX_SAMPLE_BIOS_BUCKETS];
+
+/* HLE milestone-1 ground-truth capture of the BIOS F3DD draw loop. */
+extern unsigned long vecx_hle_calls, vecx_hle_tot_count, vecx_hle_tot_cyc, vecx_hle_tot_vec;
+extern unsigned vecx_hle_s_count, vecx_hle_s_listx, vecx_hle_s_list[6];
+extern long vecx_hle_s_cyc, vecx_hle_s_vec, vecx_hle_s_sx, vecx_hle_s_sy;
+extern long vecx_hle_s_v[2][5];
+extern int vecx_hle_s_valid;
+extern unsigned long vecx_hle_ok, vecx_hle_cntmiss, vecx_hle_geommiss;
+extern int vecx_hle_mm_valid;
+extern long vecx_hle_mm_idx, vecx_hle_mm_npred, vecx_hle_mm_nreal;
+extern long vecx_hle_mm_p[4], vecx_hle_mm_r[4];
+extern int vecx_hle_enabled;
+extern unsigned long vecx_hle_exec_calls;
+extern unsigned long vecx_hle_max_scale, vecx_hle_max_ent;
+void vecx_hle_reset (void);
 
 VECX_NOINLINE unsigned char vecx_read8 (unsigned address);
 VECX_NOINLINE void vecx_write8 (unsigned address, unsigned char data);

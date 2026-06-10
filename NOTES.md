@@ -398,6 +398,33 @@ Native (3.3×) is out — it needs custom TCM linking the SDK loader blocks. The
 - **ITCM as a code target — PROVEN CLOSED (2026-06-10):** probed the F746's 16 KB ITCM to escape the 3.6 KB DTCM pool. Reading an ITCM address *and* the privileged SCB/MPU registers both hard-faulted; `MRS CONTROL` returned `0x7` → **`nPRIV=1`, the game runs unprivileged**. The sandbox forbids ITCM access, enabling ITCM, and MPU/TCM reconfiguration. The SDK-mapped DTCM stack-pool is the *only* fast memory we get — this is the structural root of the ceiling.
 - **Dead ends (don't revisit):** JIT (0.56×), page-table memory model, threaded dispatch, flag micro-opts, `-Os`, per-opcode switch fast paths, helper-relocation (pool wall), wait-skip gating (−6.5%), ITCM relocation (unprivileged sandbox).
 
-### Performance verdict (2026-06-10): ~33 FPS is the practical ceiling
+### HLE scoping (2026-06-10): where the cycles actually go
+
+Enabled the dormant PC profiler (`VECX_SAMPLE_PROFILE`, [vecx.c:21](vecx.c#L21)) with a region split + BIOS 256-byte bucket histogram (logged as `vecx region …`). Mine Storm, all phases:
+- **~100% of executed instructions are in the system ROM `0xE000–0xFFFF`** (`cart=0%`, `ram=0%`). NB Mine Storm is the *built-in* ROM game so its logic is here too; for normal cartridges the game code would show as `cart%`.
+- Concentrated in a few 256-byte windows: **`f400` (30–78%, tracks vector count), `f300` (18–30%), `f200` (9–15%)** + `f500/f600/f900`; `e500/eb00` = Mine Storm's own logic. These `f200–f600` windows are the **shared BIOS draw/math library** (fixed addresses every game calls), so HLE-ing them generalizes.
+- Hottest inner loops: `f4eb/f4ed/f4ee/f4ef` (intro), `f33d/f33f`, `f425/f427` — the per-vector beam-draw/timing spins.
+- **The cheap skip is spent:** `VECX_BIOS_DELAY_SKIP` ([vecx.c:1390](vecx.c#L1390)) already targets `0xf4eb` and regressed — during the draw loop the analog beam is integrated *per cycle* to make the vector, so you can't skip cycles, only the cheap CPU spin, and the per-instruction probe costs more than it saves.
+- **HLE verdict:** the only version with a payoff is the *hard* one — intercept the BIOS draw routines (`Draw_VL`/`Mov_Draw_VL`, `f300/f400`) at entry and synthesize their vector output + cycle cost directly, bypassing both the CPU spin and the per-cycle analog integration. Real reimplementation, real accuracy risk, but the one credible path to 1.3–1.6×. Profiler left in, gated off.
+
+### HLE milestone 1 (2026-06-10): F410 geometry PROVEN bit-exact
+
+Built a 6809 disassembler ([tools/dis6809.py](tools/dis6809.py)) + an on-device ground-truth capture + shadow validator (`VECX_HLE_CAPTURE` in [vecx.c](vecx.c)). Findings for Mine Storm's hot gameplay draw routine `Mov_Draw_VL` @ `F410` (3-byte entries `[mode, dy, dx]`, terminate when `(signed)mode > 0`, exit `F430`→`F34F`):
+- **Geometry (verified bit-exact):** `dx = dx_signed × scale`, `dy = −dy_signed × scale`, where `scale = via_t1ll` (the `$D004` T1 latch). `mode==0`=move (reposition, emits an invisible zero-length dot), `mode<0`=draw (line). The real `alg` path also emits zero-length junction dots between drawn lines — filter degenerate vectors and the visible lines match **100%** when in-bounds (`OK==calls`, many windows).
+- **Only divergence:** boundary-crossing vectors — `alg` clips the recorded endpoint where the beam leaves the `[0,33000]×[0,41000]` box ([alg_sstep:1124](vecx.c#L1124)); the predictor doesn't. Sub-pixel, edge-only, non-cascading (~2–5% of calls).
+- **Active-intercept design:** HLE in-bounds draws (provably exact), fall back to the real routine for edge-crossers. F410 ≈ gameplay only (the intro title uses `F4C0`); est. gameplay gain ~+25–30%.
+
+### HLE milestone 2 (2026-06-10): active F410 intercept — works, +17-25%, one residual crash
+
+`VECX_HLE_ACTIVE` ([vecx.c:23](vecx.c#L23)) intercepts F410 in the emu loop: bounds-check (fall back to the real routine on any OOB endpoint), emit the predicted lines via `alg_addline` (no analog cycle-sensitivity → no glitch), then replicate the per-entry Timer-1 restart (`CLR $D005`) with the beam force-blanked so `machine_advance` advances timers/sound/frame without re-emitting. CPU resumes at F430.
+- **Measured:** +17% at ~160 vectors (33.5 vs ~28.5), +24-25% at ~80-100 vectors (42-47 vs ~33-38). Rendering correct, `wait_skips` healthy. **Better than the +12-15% first estimate** (that was lighter/intro-phase data).
+- **Open bug → EXPERIMENTAL, OFF by default (`VECX_HLE_ACTIVE 0`).** After sustained play the game FREEZES — confirmed via the device `crashlog.txt`: a **watchdog reset** (`pc:0803xxxx`/`lr:080164e7`, firmware), i.e. a hang/state-desync, NOT a memory fault. Localized by bisection but not fixed:
+  - emission OFF (skip `alg_addline`) still freezes → it's NOT the vector emission;
+  - bailing RAM-resident lists, the frame-boundary guard, the first-entry-always-drawn fix, and accurate per-entry cycle accounting (+65 setup cyc) each did NOT fix it;
+  - conclusion: skipping F410 disrupts a BIOS Timer-1/frame-state interaction that occasionally leaves the game spinning (display freezes → watchdog). The remaining fix needs cycle-exact VIA/T1 state replication that I didn't crack.
+- **Fixes already in the code (gated):** process-first-entry-always (matches BIOS), scale==0 / beam-OOB / >48-entry bails, frame-boundary guard, per-entry T1 restart + setup-cycle accounting, predictor-based emission (glitch-free).
+- **Tooling kept:** `tools/dis6809.py`, shadow validator (`VECX_HLE_CAPTURE`), `e6809_get/set_x/pc/b/u`. Set `VECX_HLE_ACTIVE 1` to use the HLE (accepting the occasional freeze).
+
+### Performance verdict (2026-06-10): ~33 FPS ceiling for safe levers; HLE adds +17-25% gameplay but has a residual crash
 
 The **1.3–1.6× target is not reachable** with this SDK — and we now know the *structural* reason: **the game runs unprivileged (`CONTROL nPRIV=1`)**, so the only fast memory available is the SDK-mapped ~3.6 KB DTCM stack-pool. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are walled by that pool; ITCM (4× bigger) is forbidden by the sandbox; Tier 2b (wait-skip) is already optimal and regressed when touched. The heavy Mine Storm regime (~33 FPS) is the **memory-bound real-game-work floor** the assessment predicted. Banked wins stand (TCM hot core +15% over the 33.2 baseline, FAST_BATCH font fix, render decouple, phosphor flicker fix, audio + ROM picker as features). Stopped here.
