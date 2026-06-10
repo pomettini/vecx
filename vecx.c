@@ -20,13 +20,13 @@
 #define VECX_BIOS_DELAY_SKIP 0
 #define VECX_SAMPLE_PROFILE 0   /* HLE scoping rig (region split + BIOS buckets); flip to 1 to profile */
 #define VECX_SAMPLE_INTERVAL 64
-/* HLE milestone 2: active F410 intercept (Mov_Draw_VL). Works + renders correctly
- * at +17-25%, but skipping the routine desyncs a BIOS timer/state interaction that
- * occasionally FREEZES the game (watchdog reset) after sustained play -- confirmed
- * via crashlog.txt (watchdog, not a fault). Cause localized to the timing path
- * (emission ruled out by bisection) but not fully fixed. EXPERIMENTAL: off by
- * default; set to 1 to use it (accepting the occasional freeze). See NOTES.md. */
-#define VECX_HLE_ACTIVE 0
+/* HLE milestone 2: active F410 intercept (Mov_Draw_VL), +17-25% in gameplay.
+ * The "watchdog freeze" was a LIVELOCK in the emu-loop hook: on a declined call
+ * (hc==0: OOB list, scale 0, frame boundary) it `continue`d without executing
+ * anything, so PC stayed at F410 and the loop re-probed forever -> update()
+ * never returned -> firmware watchdog. Fixed: declines fall through to the
+ * real routine. See NOTES.md. */
+#define VECX_HLE_ACTIVE 1
 #define VECX_HLE_CAPTURE 0      /* shadow capture/validator (set 1 + ACTIVE 0 to re-validate geometry) */
 
 unsigned char rom[8192];
@@ -219,6 +219,7 @@ long vecx_hle_mm_idx, vecx_hle_mm_npred, vecx_hle_mm_nreal;
 long vecx_hle_mm_p[4], vecx_hle_mm_r[4];
 int vecx_hle_enabled = 1;            /* gated by VECX_HLE_ACTIVE (compile flag) */
 unsigned long vecx_hle_exec_calls;  /* F410 calls HLE'd this window */
+unsigned long vecx_hle_declines;    /* F410 calls declined -> real routine ran */
 unsigned long vecx_hle_max_scale, vecx_hle_max_ent;  /* diagnostics */
 
 void vecx_hle_reset (void)
@@ -228,6 +229,7 @@ void vecx_hle_reset (void)
 	vecx_hle_s_valid = 0;
 	vecx_hle_mm_valid = 0;
 	vecx_hle_exec_calls = 0;
+	vecx_hle_declines = 0;
 	vecx_hle_max_scale = 0;
 	vecx_hle_max_ent = 0;
 }
@@ -1797,9 +1799,16 @@ void vecx_emu (long cycles)
 		if (vecx_hle_enabled && e6809_get_pc () == 0xf410u &&
 			e6809_get_dp () == 0xd0u) {
 			unsigned hc = vecx_hle_f410_exec ();
-			cycle_count += hc;
-			cycles -= (long) hc;
-			continue;
+			/* hc == 0 means the intercept DECLINED (OOB list, scale 0, frame
+			 * boundary, ...) without touching state. Fall through so the real
+			 * routine executes -- `continue` here would re-probe F410 with
+			 * nothing advanced = infinite loop = the watchdog freeze. */
+			if (hc > 0) {
+				cycle_count += hc;
+				cycles -= (long) hc;
+				continue;
+			}
+			vecx_hle_declines++;
 		}
 #endif
 

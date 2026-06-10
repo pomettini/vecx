@@ -418,13 +418,36 @@ Built a 6809 disassembler ([tools/dis6809.py](tools/dis6809.py)) + an on-device 
 
 `VECX_HLE_ACTIVE` ([vecx.c:23](vecx.c#L23)) intercepts F410 in the emu loop: bounds-check (fall back to the real routine on any OOB endpoint), emit the predicted lines via `alg_addline` (no analog cycle-sensitivity → no glitch), then replicate the per-entry Timer-1 restart (`CLR $D005`) with the beam force-blanked so `machine_advance` advances timers/sound/frame without re-emitting. CPU resumes at F430.
 - **Measured:** +17% at ~160 vectors (33.5 vs ~28.5), +24-25% at ~80-100 vectors (42-47 vs ~33-38). Rendering correct, `wait_skips` healthy. **Better than the +12-15% first estimate** (that was lighter/intro-phase data).
-- **Open bug → EXPERIMENTAL, OFF by default (`VECX_HLE_ACTIVE 0`).** After sustained play the game FREEZES — confirmed via the device `crashlog.txt`: a **watchdog reset** (`pc:0803xxxx`/`lr:080164e7`, firmware), i.e. a hang/state-desync, NOT a memory fault. Localized by bisection but not fixed:
-  - emission OFF (skip `alg_addline`) still freezes → it's NOT the vector emission;
-  - bailing RAM-resident lists, the frame-boundary guard, the first-entry-always-drawn fix, and accurate per-entry cycle accounting (+65 setup cyc) each did NOT fix it;
-  - conclusion: skipping F410 disrupts a BIOS Timer-1/frame-state interaction that occasionally leaves the game spinning (display freezes → watchdog). The remaining fix needs cycle-exact VIA/T1 state replication that I didn't crack.
-- **Fixes already in the code (gated):** process-first-entry-always (matches BIOS), scale==0 / beam-OOB / >48-entry bails, frame-boundary guard, per-entry T1 restart + setup-cycle accounting, predictor-based emission (glitch-free).
-- **Tooling kept:** `tools/dis6809.py`, shadow validator (`VECX_HLE_CAPTURE`), `e6809_get/set_x/pc/b/u`. Set `VECX_HLE_ACTIVE 1` to use the HLE (accepting the occasional freeze).
+- **The freeze (solved 2026-06-10, see milestone 3):** after sustained play the game froze with a **watchdog reset** in `crashlog.txt`. A bisection session chased it as an emulated-state desync (emission off, RAM-list bails, frame-boundary guard, +65 setup-cycle accounting — none fixed it) and the build shipped experimental-off. The real cause turned out to be a trivial host-side livelock in the *hook*, not the emulation — see below.
+- **Fixes in the code from this phase:** process-first-entry-always (matches BIOS), scale==0 / beam-OOB / >48-entry bails, frame-boundary guard, per-entry T1 restart + setup-cycle accounting, predictor-based emission (glitch-free).
+- **Tooling kept:** `tools/dis6809.py`, shadow validator (`VECX_HLE_CAPTURE`), `e6809_get/set_x/pc/b/u`.
 
-### Performance verdict (2026-06-10): ~33 FPS ceiling for safe levers; HLE adds +17-25% gameplay but has a residual crash
+### HLE milestone 3 (2026-06-10): freeze SOLVED — it was a livelock in the hook, not a timer desync
 
-The **1.3–1.6× target is not reachable** with this SDK — and we now know the *structural* reason: **the game runs unprivileged (`CONTROL nPRIV=1`)**, so the only fast memory available is the SDK-mapped ~3.6 KB DTCM stack-pool. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are walled by that pool; ITCM (4× bigger) is forbidden by the sandbox; Tier 2b (wait-skip) is already optimal and regressed when touched. The heavy Mine Storm regime (~33 FPS) is the **memory-bound real-game-work floor** the assessment predicted. Banked wins stand (TCM hot core +15% over the 33.2 baseline, FAST_BATCH font fix, render decouple, phosphor flicker fix, audio + ROM picker as features). Stopped here.
+**Root cause.** `vecx_hle_f410_exec()` returns 0 to *decline* a call (scale==0, beam off-screen, any OOB list endpoint, >48 entries, frame-boundary guard) so the real BIOS routine can handle it. But the emu-loop hook did `continue` **unconditionally**:
+
+```c
+unsigned hc = vecx_hle_f410_exec ();
+cycle_count += hc;
+cycles -= (long) hc;   /* hc == 0 on decline! */
+continue;              /* PC still F410 -> re-probe -> decline -> forever */
+```
+
+On a decline nothing executed and no cycles advanced, so the loop re-entered the same check with identical state: an **infinite loop inside `update()`** → the Playdate firmware watchdog reset the device. That is exactly the crashlog signature (watchdog, firmware PC, not a memory fault).
+
+**Why it masqueraded as a state desync.** Declines only happen when a vector list touches the screen-bounds box (or the rarer guards fire), so calm play ran clean for minutes:
+- *ship explosion* → fragments fly to the edges → first OOB endpoint → instant hang;
+- *rotating near the screen edge* → same;
+- *"eventually, even during the intro"* → the frame-boundary guard — added during bisection **as a fix** — was itself a new decline path, so it created new freezes;
+- *emission-off still froze* → of course: the bug was in the hook, which bisection never varied.
+
+**Fix** ([vecx.c:1796](vecx.c#L1796)): only `continue` when `hc > 0`; a decline falls through so the interpreter executes the real F410 routine for that call. All decline paths return before any state mutation (pass 1 is read-only), so the fallback is clean. Added a `vecx_hle_declines` counter to the `hle-active` log line as on-device proof.
+
+**Device-confirmed (Jun 10 2026 22:43 build, sustained play, no crash):** `declined=` ran 0–1159 per 5s window — every single one of those would have been a watchdog freeze before — while the game kept playing. Performance held: heavy waves (~150–172 vectors) at **33.4–35.4 FPS** vs the ~28.5 real-routine floor (**~+19%**), mid-gameplay (~90–120 vectors) at **38–46 FPS** (+17–25%). `VECX_HLE_ACTIVE` is now **1 (on by default)**.
+
+**Lesson.** The watchdog signature said "host C code stopped making progress," which points at the *hook/loop plumbing*, not the emulated machine. The bisection burned ~12 device cycles varying the emulation (emission, cycle accounting, guards) when the one thing every freeze shared — the decline path — was never under test. When an intercept has a fallback contract ("return 0 → caller runs the real thing"), verify the caller actually honors it.
+
+### Performance verdict (2026-06-10, updated): HLE shipped ON; gameplay now 33-46 FPS
+
+The **1.3–1.6× generic-lever target is not reachable** with this SDK — the structural reason stands: **the game runs unprivileged (`CONTROL nPRIV=1`)**, so the only fast memory available is the SDK-mapped ~3.6 KB DTCM stack-pool. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are walled by that pool; ITCM (4× bigger) is forbidden by the sandbox; Tier 2b (wait-skip) is already optimal and regressed when touched.
+**But the HLE lever landed:** with the F410 intercept fixed and enabled, the heavy Mine Storm regime moved from ~28.5 to ~33.4–35.4 FPS and mid-gameplay runs 38–46 FPS. Banked wins: TCM hot core (+15% over the 33.2 baseline), F410 HLE (+17–25% gameplay), FAST_BATCH font fix, render decouple, phosphor flicker fix, audio + ROM picker as features. Possible follow-up if more speed is ever wanted: HLE the remaining hot BIOS draw windows (F4C0 intro draw, F3DD Draw_VL at `f300`) using the same validated recipe.

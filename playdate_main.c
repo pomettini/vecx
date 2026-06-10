@@ -356,10 +356,11 @@ static void log_hle_capture(void)
 {
 	unsigned long c = vecx_hle_calls ? vecx_hle_calls : 1;
 
-	if (vecx_hle_exec_calls != 0) {
+	if (vecx_hle_exec_calls != 0 || vecx_hle_declines != 0) {
 		pd->system->logToConsole(
-			"vecx hle-active: HLE'd %lu F410 calls, max_scale=%lu max_ent=%lu (enabled=%d)",
-			vecx_hle_exec_calls, vecx_hle_max_scale, vecx_hle_max_ent, vecx_hle_enabled);
+			"vecx hle-active: HLE'd %lu F410 calls, declined=%lu max_scale=%lu max_ent=%lu (enabled=%d)",
+			vecx_hle_exec_calls, vecx_hle_declines, vecx_hle_max_scale,
+			vecx_hle_max_ent, vecx_hle_enabled);
 		return;
 	}
 

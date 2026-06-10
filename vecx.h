@@ -88,6 +88,7 @@ extern long vecx_hle_mm_idx, vecx_hle_mm_npred, vecx_hle_mm_nreal;
 extern long vecx_hle_mm_p[4], vecx_hle_mm_r[4];
 extern int vecx_hle_enabled;
 extern unsigned long vecx_hle_exec_calls;
+extern unsigned long vecx_hle_declines;
 extern unsigned long vecx_hle_max_scale, vecx_hle_max_ent;
 void vecx_hle_reset (void);
 
