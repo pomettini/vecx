@@ -27,13 +27,19 @@
  * never returned -> firmware watchdog. Fixed: declines fall through to the
  * real routine. See NOTES.md. */
 #define VECX_HLE_ACTIVE 1
-#define VECX_HLE_CAPTURE 0      /* shadow capture/validator (set 1 + ACTIVE/PAT 0 to re-validate) */
+#define VECX_HLE_CAPTURE 0      /* shadow capture/validator (set 1 + actives 0 to re-validate) */
 /* HLE milestone 4: active Draw_Pat_VL (F437) intercept. Geometry validated
  * bit-exact by the F437 shadow validator (~50k strokes, geommiss=0, 2026-06-11):
  * dash segments from the SR schedule (bits 7..4 pre-stroke, reload at +14,
  * period 18, hold bit0), endpoint = start + (dx,-dy)*scale. Per-entry
  * intercept: one stroke, resume at F463 (the BIOS keeps its own count/exit). */
 #define VECX_HLE_PAT 1
+/* HLE milestone 5: active Draw_VL/Draw_VLc (F3DD) intercept -- the SOLID-line
+ * sibling of F437 and Berzerk's room-drawing path (~48% of its instructions).
+ * Geometry validated bit-exact (~50k strokes, geommiss=0, 2026-06-11): one
+ * line per entry, start -> start + (dx,-dy)*scale. Per-entry intercept,
+ * resume at F3FB (BIOS keeps its own count/loop/exit). */
+#define VECX_HLE_VL 1
 
 unsigned char rom[8192];
 unsigned char cart[32768];
@@ -233,6 +239,14 @@ unsigned long vecx_hle_pat_calls, vecx_hle_pat_ok;
 unsigned long vecx_hle_pat_cntmiss, vecx_hle_pat_geommiss;
 /* Draw_Pat_VL active-intercept counters (HLE-pat milestone 2). */
 unsigned long vecx_hle_pat_exec_calls, vecx_hle_pat_exec_declines;
+/* Draw_VL/Draw_VLc (F3DD solid-line list loop) shadow + active counters. */
+unsigned long vecx_hle_vl_calls, vecx_hle_vl_ok;
+unsigned long vecx_hle_vl_cntmiss, vecx_hle_vl_geommiss;
+int vecx_hle_vl_mm_valid;
+long vecx_hle_vl_mm_nreal;
+long vecx_hle_vl_mm_p[4], vecx_hle_vl_mm_r[4];
+unsigned vecx_hle_vl_mm_scale;
+unsigned long vecx_hle_vl_exec_calls, vecx_hle_vl_exec_declines;
 int vecx_hle_pat_mm_valid;
 long vecx_hle_pat_mm_idx, vecx_hle_pat_mm_npred, vecx_hle_pat_mm_nreal;
 long vecx_hle_pat_mm_p[4], vecx_hle_pat_mm_r[4];
@@ -252,6 +266,10 @@ void vecx_hle_reset (void)
 	vecx_hle_pat_cntmiss = vecx_hle_pat_geommiss = 0;
 	vecx_hle_pat_mm_valid = 0;
 	vecx_hle_pat_exec_calls = vecx_hle_pat_exec_declines = 0;
+	vecx_hle_vl_calls = vecx_hle_vl_ok = 0;
+	vecx_hle_vl_cntmiss = vecx_hle_vl_geommiss = 0;
+	vecx_hle_vl_mm_valid = 0;
+	vecx_hle_vl_exec_calls = vecx_hle_vl_exec_declines = 0;
 }
 
 #if VECX_HLE_CAPTURE
@@ -479,6 +497,94 @@ static void vecx_hle_pat_predict (long sx, long sy, long dyb, long dxb,
 #endif /* VECX_HLE_CAPTURE || VECX_HLE_PAT */
 
 #if VECX_HLE_CAPTURE
+/* ---- Draw_VL/Draw_VLc (F3DD) per-entry shadow validator ----
+ * The solid-line sibling of Draw_Pat_VL: per entry [dy, dx] the loop loads
+ * SR=$FF (beam solid for the whole stroke), restarts T1, spins, blanks.
+ * Prediction: ONE line, start -> start + (dx, -dy) * scale; the real path's
+ * leading/trailing zero-length dots are filtered by the usual diff.
+ * Window: F3DD entry -> F3FB (the BIOS's own count/loop/exit logic). */
+static int hle_vl_active;
+static long hle_vl_vcnt0;
+static long hle_vl_p[4];
+static unsigned hle_vl_scale;
+
+static einline void vecx_hle_vl_capture (unsigned pc)
+{
+	if (!hle_vl_active) {
+		if (pc == 0xf3ddu && e6809_get_dp () == 0xd0u) {
+			unsigned x = e6809_get_x ();
+			long scale = (long) via_t1ll;
+			long dyb = (long) (signed char) vecx_peek8 (x);
+			long dxb = (long) (signed char) vecx_peek8 (x + 1);
+
+			hle_vl_active = 1;
+			hle_vl_vcnt0 = vector_draw_cnt;
+			hle_vl_scale = via_t1ll;
+			hle_vl_p[0] = alg_curr_x;
+			hle_vl_p[1] = alg_curr_y;
+			hle_vl_p[2] = alg_curr_x + dxb * scale;
+			hle_vl_p[3] = alg_curr_y - dyb * scale;
+		}
+		return;
+	}
+
+	if (pc != 0xf3fbu)
+		return;
+
+	{
+		long dv = vector_draw_cnt - hle_vl_vcnt0;
+		long ir = 0;
+		int npred = (hle_vl_p[0] != hle_vl_p[2] || hle_vl_p[1] != hle_vl_p[3]);
+		int miss = 0;
+
+		hle_vl_active = 0;
+		vecx_hle_vl_calls++;
+
+		while (ir < dv &&
+			   vectors_draw[hle_vl_vcnt0 + ir].x0 == vectors_draw[hle_vl_vcnt0 + ir].x1 &&
+			   vectors_draw[hle_vl_vcnt0 + ir].y0 == vectors_draw[hle_vl_vcnt0 + ir].y1)
+			ir++;
+
+		if (npred == 0) {
+			if (ir < dv)
+				miss = 1;                     /* predicted nothing, real drew */
+		} else if (ir >= dv) {
+			miss = 1;                         /* predicted a line, real drew none */
+		} else {
+			vector_t *rv = &vectors_draw[hle_vl_vcnt0 + ir];
+
+			if (hle_vl_p[0] != rv->x0 || hle_vl_p[1] != rv->y0 ||
+				hle_vl_p[2] != rv->x1 || hle_vl_p[3] != rv->y1) {
+				miss = 2;
+				if (!vecx_hle_vl_mm_valid) {
+					vecx_hle_vl_mm_valid = 1;
+					vecx_hle_vl_mm_nreal = dv;
+					vecx_hle_vl_mm_scale = hle_vl_scale;
+					vecx_hle_vl_mm_p[0] = hle_vl_p[0]; vecx_hle_vl_mm_p[1] = hle_vl_p[1];
+					vecx_hle_vl_mm_p[2] = hle_vl_p[2]; vecx_hle_vl_mm_p[3] = hle_vl_p[3];
+					vecx_hle_vl_mm_r[0] = rv->x0; vecx_hle_vl_mm_r[1] = rv->y0;
+					vecx_hle_vl_mm_r[2] = rv->x1; vecx_hle_vl_mm_r[3] = rv->y1;
+				}
+			} else {
+				/* any SECOND visible line in the window is a count miss */
+				for (ir++; ir < dv; ir++) {
+					vector_t *xv = &vectors_draw[hle_vl_vcnt0 + ir];
+					if (xv->x0 != xv->x1 || xv->y0 != xv->y1) {
+						miss = 1;
+						break;
+					}
+				}
+			}
+		}
+		if (miss == 0)
+			vecx_hle_vl_ok++;
+		else if (miss == 1)
+			vecx_hle_vl_cntmiss++;
+		else
+			vecx_hle_vl_geommiss++;
+	}
+}
+
 static int hle_pat_active;
 static unsigned hle_pat_listx;
 static long hle_pat_vcnt0;
@@ -1736,9 +1842,8 @@ static einline unsigned vecx_cycles_until_ifr_mask (unsigned poll_mask)
 #endif
 
 #if VECX_WAIT_LOOP_SKIP
-static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles)
+static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles, unsigned pc)
 {
-	unsigned pc;
 	unsigned poll_mask;
 	unsigned wait_cycles;
 
@@ -1753,8 +1858,8 @@ static einline unsigned vecx_try_skip_ifr_wait (long remaining_cycles)
 	 *   f3f4  Draw_VLcs T1 spin            BITB, mask in B
 	 *   f425  Mov_Draw_VL T1 spin (runs when the F410 HLE declines) BITB, B
 	 * Skipping is exact: vecx_machine_advance still integrates the analog beam
-	 * over the skipped cycles, only the CPU spin is collapsed. */
-	pc = e6809_get_pc ();
+	 * over the skipped cycles, only the CPU spin is collapsed.
+	 * pc is fetched ONCE by the caller and shared with the HLE hooks. */
 	if (pc == 0xf19e) {
 		poll_mask = e6809_get_a () & 0xff;
 	}
@@ -2009,6 +2114,64 @@ static unsigned vecx_hle_f437_exec (void)
 }
 #endif
 
+#if VECX_HLE_VL
+/* Active HLE of ONE Draw_VL/Draw_VLc (F3DD) solid stroke: one alg_addline,
+ * advance the VIA/frame by the stroke's cycle cost with the beam blanked,
+ * resume at F3FB (the BIOS keeps its own count/loop/exit -- the F3DA loop has
+ * no early-exit path, so unlike F437 there is no tiny-scale special case).
+ * Returns cycles consumed, or 0 to DECLINE (the real routine then runs). */
+#define HLE_VL_SETUP_CYC 39u    /* F3DD..F3ED: LDD/STA/CLR/LEAX/NOP/INC/STB/LDD/STA */
+#define HLE_VL_TAIL_CYC  12u    /* poll exit + NOP + STA <$0A before F3FB */
+
+static unsigned vecx_hle_f3dd_exec (void)
+{
+	unsigned x = e6809_get_x ();
+	long scale = (long) via_t1ll;
+	long sx = alg_curr_x, sy = alg_curr_y;
+	long dyb = (long) (signed char) vecx_peek8 (x);
+	long dxb = (long) (signed char) vecx_peek8 (x + 1);
+	long ex, ey;
+	unsigned total = 0;
+
+	if (scale == 0)
+		return 0;
+	ex = sx + dxb * scale;
+	ey = sy - dyb * scale;
+	if (sx < 0 || sx >= ALG_MAX_X || sy < 0 || sy >= ALG_MAX_Y)
+		return 0;                           /* alg clips OOB; the HLE doesn't */
+	if (ex < 0 || ex >= ALG_MAX_X || ey < 0 || ey >= ALG_MAX_Y)
+		return 0;
+	if (fcycles < (long) (scale + 80))
+		return 0;                           /* no frame flip mid-intercept */
+
+	if (ex != sx || ey != sy)
+		alg_addline (sx, sy, ex, ey, (unsigned char) alg_zsh);
+
+	{
+		unsigned s_cb2s = via_cb2s, s_cb2h = via_cb2h, s_srb = via_srb;
+		unsigned dur;
+
+		via_cb2s = 0; via_cb2h = 0; via_srb = 8;
+		vecx_machine_advance (HLE_VL_SETUP_CYC);
+		total += HLE_VL_SETUP_CYC;
+		vecx_write8 (0xd005u, 0x00u);       /* restart T1 from its latch */
+		dur = vecx_cycles_until_ifr_mask (0x40u);
+		if (dur == 0u)
+			dur = 1u;
+		vecx_machine_advance (dur + HLE_VL_TAIL_CYC);
+		total += dur + HLE_VL_TAIL_CYC;
+		via_cb2s = s_cb2s; via_cb2h = s_cb2h; via_srb = s_srb;
+	}
+	alg_curr_x = ex; alg_curr_y = ey;
+	alg_vectoring = 0;
+
+	e6809_set_x (x + 2);
+	e6809_set_pc (0xf3fbu);                 /* BIOS count/loop/exit runs */
+	vecx_hle_vl_exec_calls++;
+	return total;
+}
+#endif
+
 void vecx_emu (long cycles)
 {
 	unsigned icycles;
@@ -2024,18 +2187,24 @@ void vecx_emu (long cycles)
 #endif
 
 	while (cycles > 0) {
+		/* ONE pc fetch per iteration, shared by the wait-skip probe, the
+		 * profiler/validators and the HLE hooks. e6809.c builds without LTO,
+		 * so each e6809_get_pc() is a real call -- four of them per
+		 * instruction measured ~-10% on Mine Storm. */
+		unsigned pc = e6809_get_pc ();
+
 #if VECX_WAIT_LOOP_SKIP
 		unsigned skip_cycles = 0;
 
 #if VECX_MACHINE_ADVANCE_BATCH > 1
 		if (pending_cycles == 0) {
-			skip_cycles = vecx_try_skip_ifr_wait (cycles);
+			skip_cycles = vecx_try_skip_ifr_wait (cycles, pc);
 		}
 #else
 		/* Probe EVERY instruction: gating it (every 8th) measured -6.5% because the
 		 * Wait_Recal IFR-poll loop is often short and the missed short waits cost
-		 * far more than the per-instruction e6809_get_pc() probe. Leave it as-is. */
-		skip_cycles = vecx_try_skip_ifr_wait (cycles);
+		 * far more than the per-instruction probe. Leave it as-is. */
+		skip_cycles = vecx_try_skip_ifr_wait (cycles, pc);
 #endif
 
 		if (skip_cycles > 0) {
@@ -2065,45 +2234,56 @@ void vecx_emu (long cycles)
 
 #if VECX_SAMPLE_PROFILE
 		if ((instruction_count & (VECX_SAMPLE_INTERVAL - 1U)) == 0) {
-			vecx_sample_record (e6809_get_pc ());
+			vecx_sample_record (pc);
 		}
 #endif
 
 #if VECX_HLE_CAPTURE
-		vecx_hle_capture (e6809_get_pc (), cycle_count);
-		vecx_hle_pat_capture (e6809_get_pc ());
+		vecx_hle_capture (pc, cycle_count);
+		vecx_hle_pat_capture (pc);
+		vecx_hle_vl_capture (pc);
 #endif
+
+#if VECX_HLE_ACTIVE || VECX_HLE_PAT || VECX_HLE_VL
+		/* All three intercept entry PCs live in F3DD..F437: one range check
+		 * filters the common path. On a DECLINE (hc == 0, no state touched)
+		 * fall through so the real routine runs -- `continue` there would
+		 * livelock (the watchdog-freeze lesson). */
+		if (vecx_hle_enabled && pc >= 0xf3ddu && pc <= 0xf437u &&
+			e6809_get_dp () == 0xd0u) {
+			unsigned hc = 0;
+			int hooked = 0;
 
 #if VECX_HLE_ACTIVE
-		if (vecx_hle_enabled && e6809_get_pc () == 0xf410u &&
-			e6809_get_dp () == 0xd0u) {
-			unsigned hc = vecx_hle_f410_exec ();
-			/* hc == 0 means the intercept DECLINED (OOB list, scale 0, frame
-			 * boundary, ...) without touching state. Fall through so the real
-			 * routine executes -- `continue` here would re-probe F410 with
-			 * nothing advanced = infinite loop = the watchdog freeze. */
-			if (hc > 0) {
-				cycle_count += hc;
-				cycles -= (long) hc;
-				continue;
+			if (pc == 0xf410u) {
+				hc = vecx_hle_f410_exec ();
+				hooked = 1;
+				if (hc == 0)
+					vecx_hle_declines++;
 			}
-			vecx_hle_declines++;
-		}
 #endif
-
 #if VECX_HLE_PAT
-		if (vecx_hle_enabled && e6809_get_pc () == 0xf437u &&
-			e6809_get_dp () == 0xd0u) {
-			unsigned hc = vecx_hle_f437_exec ();
-			/* same contract as F410: hc == 0 means DECLINED with no state
-			 * touched -- fall through so the real routine runs. `continue`
-			 * here would livelock (the watchdog-freeze lesson). */
+			if (pc == 0xf437u) {
+				hc = vecx_hle_f437_exec ();
+				hooked = 1;
+				if (hc == 0)
+					vecx_hle_pat_exec_declines++;
+			}
+#endif
+#if VECX_HLE_VL
+			if (pc == 0xf3ddu) {
+				hc = vecx_hle_f3dd_exec ();
+				hooked = 1;
+				if (hc == 0)
+					vecx_hle_vl_exec_declines++;
+			}
+#endif
+			(void) hooked;
 			if (hc > 0) {
 				cycle_count += hc;
 				cycles -= (long) hc;
 				continue;
 			}
-			vecx_hle_pat_exec_declines++;
 		}
 #endif
 

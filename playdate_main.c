@@ -382,6 +382,26 @@ static void log_hle_capture(void)
 {
 	unsigned long c = vecx_hle_calls ? vecx_hle_calls : 1;
 
+	if (vecx_hle_vl_exec_calls != 0 || vecx_hle_vl_exec_declines != 0)
+		pd->system->logToConsole(
+			"vecx hle-vl-active: HLE'd %lu F3DD strokes, declined=%lu",
+			vecx_hle_vl_exec_calls, vecx_hle_vl_exec_declines);
+
+	if (vecx_hle_vl_calls != 0) {
+		pd->system->logToConsole(
+			"vecx hle-vl: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu (F3DD shadow)",
+			vecx_hle_vl_calls, vecx_hle_vl_ok,
+			vecx_hle_vl_cntmiss, vecx_hle_vl_geommiss);
+		if (vecx_hle_vl_mm_valid)
+			pd->system->logToConsole(
+				"vecx hle-vl-MISMATCH: scale=%u nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
+				vecx_hle_vl_mm_scale, vecx_hle_vl_mm_nreal,
+				vecx_hle_vl_mm_p[0], vecx_hle_vl_mm_p[1],
+				vecx_hle_vl_mm_p[2], vecx_hle_vl_mm_p[3],
+				vecx_hle_vl_mm_r[0], vecx_hle_vl_mm_r[1],
+				vecx_hle_vl_mm_r[2], vecx_hle_vl_mm_r[3]);
+	}
+
 	if (vecx_hle_pat_exec_calls != 0 || vecx_hle_pat_exec_declines != 0)
 		pd->system->logToConsole(
 			"vecx hle-pat-active: HLE'd %lu F437 strokes, declined=%lu",

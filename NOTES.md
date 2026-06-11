@@ -477,7 +477,7 @@ The D-pad mapping was hardwired to a transposed orientation (physical Right drov
 | Mine Storm (built-in) | OK | 34–46 FPS | HLE validated bit-exact; the dev baseline |
 | Armor Attack (1982) | OK | ~~30~~ **41.5–48 FPS** (F437 HLE, 2026-06-11) | maze = patterned lines (`Draw_Pat_VL`). NB the game has an INVISIBLE-WALLS menu option (button 2) — not a bug |
 | Bedlam (1983) | OK | 35–39 FPS | logic-heavy (CPI ~1.5–2.5, 5–8k instr/update); HLE scale=4 clean |
-| Berzerk (1982) | OK | ~26–28 FPS | NOT pattern-drawn (zero F437 calls in gameplay); compute-heavy cart code, would need its own profiling. Slowest tested |
+| Berzerk (1982) | OK | ~~26–28~~ **33.5–37 FPS** (F3DD HLE, 2026-06-11) | rooms = solid-line lists (`Draw_VL`/F3DA loop, was 48% of its instructions) |
 | Rip-Off (1982) | OK | ~46–50 FPS, ~57–61% native pacing w/ adaptive | the light-game showcase |
 
 Takeaways: the F410 HLE generalizes (3 very different list shapes, zero artifacts, decline/fallback exercised); `Draw_Pat_VL`/`Draw_VL_mode` (dashed lines) never pass through F410 so they're structurally untouched by the HLE; the games that lag (~28–30 FPS) are the ones drawing big pattern/wall scenery — the remaining perf lever for them would be an HLE of `Draw_Pat_VL` (predict the dash on/off segments; same recipe, moderate effort, unscheduled).
@@ -488,6 +488,13 @@ The pattern-line path was the last expensive BIOS draw routine: while the shift 
 - **Geometry validated bit-exact FIRST TRY** (shadow validator, ~50k strokes, `geommiss=0`): dash schedule in stroke-relative cycles u (0 = the F44A T1 restart): SR writes complete at u=-4 (F448, bits 7..4 consumed pre-stroke) then u=14+18k (the F45C/F459 reload loop); 8 bits at 1 bit/cycle (bit 7 first), then CB2 holds bit 0; lit runs map linearly onto the stroke (endpoint = start + (dx,-dy)·scale, the F410 rule). The instruction-timing first guess was exact — deriving constants from cycle counts beats guessing.
 - **Declines** (return 0 → real routine runs; same fall-through contract as F410): scale<24 (the F44C early-expired/RTS path becomes reachable), start/end OOB, frame-boundary, segment-cap overflow.
 - **Measured:** Armor Attack gameplay **~30 → 41.5–48.2 FPS (+40–60%)**, ~7–9k strokes HLE'd/window, declines ticking, rendering identical, no freezes. The **BIOS startup logo** also uses F437 (boot screen 32.3→33.8). Mine Storm regression-clean (unchanged band). **Berzerk: NOT a customer** — its gameplay windows show zero F437 calls; its rooms cost ~2,700 instr/update at CPI 4.5 = compute-heavy cart code, not pattern drawing. Berzerk (~26–28 FPS) would need its own profiling session; out of scope.
+
+### HLE milestone 5 (2026-06-11): Draw_VL/Draw_VLc (F3DD) intercept — Berzerk +30%; hook overhead lesson
+
+Profiling Berzerk gameplay (region split) showed its rooms are NOT pattern-drawn: **~48% of executed instructions sat in `f300`** = the `F3DA` solid-line list loop (`Draw_VL`/`Draw_VLc`: per entry `[dy,dx]`, SR=$FF for the stroke, T1 spin, count in `$C823`), with cart logic only 20–28%. `VECX_HLE_VL` ([vecx.c](vecx.c)) intercepts ONE stroke per call (PC==F3DD, DP=D0), emits one `alg_addline`, resumes at `F3FB` (BIOS keeps count/loop/exit; the F3DA loop has no early-exit path, so no tiny-scale case).
+- **Geometry validated bit-exact first try, third time running** (~50k strokes, geommiss=0): one line, `start -> start + (dx,-dy)·scale`.
+- **Measured:** Berzerk rooms **~25–27 → 33.5–37.3 FPS (+30%)**, 6–7.5k strokes/window, declines healthy, no freezes. "First level done."
+- **Hook-overhead regression + fix:** the third hook initially cost Mine Storm ~10% — every instruction paid FOUR separate `e6809_get_pc()` calls (wait-skip probe + 3 hooks; e6809.c builds `-fno-lto`, so each is a real call) plus a playdate_main.c layout roll. Fix: `vecx_emu` now fetches PC **once** per iteration, passes it to the probe, and gates all three hooks behind a single range check (`F3DD <= pc <= F437` — the three entry PCs are adjacent by design). Mine Storm recovered ~+2 FPS (residual delta vs older logs is play-regime difference: idle play sustains the full minefield and is HARSHER than active play, where destroyed rocks lighten the scene — compare regimes, not sessions). **Rule: anything probing per-instruction must share ONE pc fetch; never add a second.**
 
 ### Performance verdict (2026-06-10, updated): HLE shipped ON; gameplay now 33-46 FPS
 
