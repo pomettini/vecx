@@ -90,6 +90,14 @@ extern int vecx_hle_enabled;
 extern unsigned long vecx_hle_exec_calls;
 extern unsigned long vecx_hle_declines;
 extern unsigned long vecx_hle_max_scale, vecx_hle_max_ent;
+/* Draw_Pat_VL (F437) shadow-validation counters. */
+extern unsigned long vecx_hle_pat_calls, vecx_hle_pat_ok;
+extern unsigned long vecx_hle_pat_cntmiss, vecx_hle_pat_geommiss;
+extern unsigned long vecx_hle_pat_exec_calls, vecx_hle_pat_exec_declines;
+extern int vecx_hle_pat_mm_valid;
+extern long vecx_hle_pat_mm_idx, vecx_hle_pat_mm_npred, vecx_hle_pat_mm_nreal;
+extern long vecx_hle_pat_mm_p[4], vecx_hle_pat_mm_r[4];
+extern unsigned vecx_hle_pat_mm_pat, vecx_hle_pat_mm_scale;
 void vecx_hle_reset (void);
 
 VECX_NOINLINE unsigned char vecx_read8 (unsigned address);

@@ -475,12 +475,19 @@ The D-pad mapping was hardwired to a transposed orientation (physical Right drov
 | Game | Rendering | Speed | Notes |
 | --- | --- | --- | --- |
 | Mine Storm (built-in) | OK | 34–46 FPS | HLE validated bit-exact; the dev baseline |
-| Armor Attack (1982) | OK | ~30 FPS | maze = patterned lines (`Draw_Pat_VL`), the expensive path; HLE scale=48 clean. NB the game has an INVISIBLE-WALLS menu option (button 2) — not a bug |
+| Armor Attack (1982) | OK | ~~30~~ **41.5–48 FPS** (F437 HLE, 2026-06-11) | maze = patterned lines (`Draw_Pat_VL`). NB the game has an INVISIBLE-WALLS menu option (button 2) — not a bug |
 | Bedlam (1983) | OK | 35–39 FPS | logic-heavy (CPI ~1.5–2.5, 5–8k instr/update); HLE scale=4 clean |
-| Berzerk (1982) | OK | ~28 FPS | room walls = big scenery outside F410; slowest tested |
+| Berzerk (1982) | OK | ~26–28 FPS | NOT pattern-drawn (zero F437 calls in gameplay); compute-heavy cart code, would need its own profiling. Slowest tested |
 | Rip-Off (1982) | OK | ~46–50 FPS, ~57–61% native pacing w/ adaptive | the light-game showcase |
 
 Takeaways: the F410 HLE generalizes (3 very different list shapes, zero artifacts, decline/fallback exercised); `Draw_Pat_VL`/`Draw_VL_mode` (dashed lines) never pass through F410 so they're structurally untouched by the HLE; the games that lag (~28–30 FPS) are the ones drawing big pattern/wall scenery — the remaining perf lever for them would be an HLE of `Draw_Pat_VL` (predict the dash on/off segments; same recipe, moderate effort, unscheduled).
+
+### HLE milestone 4 (2026-06-11): Draw_Pat_VL (F437) intercept — Armor Attack +40-60%
+
+The pattern-line path was the last expensive BIOS draw routine: while the shift register clocks the dash pattern onto the beam blank, `machine_advance` must step per-cycle AND the CPU runs an 18-cycle reload loop. `VECX_HLE_PAT` ([vecx.c](vecx.c)) intercepts **one stroke per call** (PC==F437, DP=D0) and resumes at F463 so the BIOS keeps its own count/exit logic — which sidesteps the routine's dual exits (RTS vs JMP $F34F) entirely.
+- **Geometry validated bit-exact FIRST TRY** (shadow validator, ~50k strokes, `geommiss=0`): dash schedule in stroke-relative cycles u (0 = the F44A T1 restart): SR writes complete at u=-4 (F448, bits 7..4 consumed pre-stroke) then u=14+18k (the F45C/F459 reload loop); 8 bits at 1 bit/cycle (bit 7 first), then CB2 holds bit 0; lit runs map linearly onto the stroke (endpoint = start + (dx,-dy)·scale, the F410 rule). The instruction-timing first guess was exact — deriving constants from cycle counts beats guessing.
+- **Declines** (return 0 → real routine runs; same fall-through contract as F410): scale<24 (the F44C early-expired/RTS path becomes reachable), start/end OOB, frame-boundary, segment-cap overflow.
+- **Measured:** Armor Attack gameplay **~30 → 41.5–48.2 FPS (+40–60%)**, ~7–9k strokes HLE'd/window, declines ticking, rendering identical, no freezes. The **BIOS startup logo** also uses F437 (boot screen 32.3→33.8). Mine Storm regression-clean (unchanged band). **Berzerk: NOT a customer** — its gameplay windows show zero F437 calls; its rooms cost ~2,700 instr/update at CPI 4.5 = compute-heavy cart code, not pattern drawing. Berzerk (~26–28 FPS) would need its own profiling session; out of scope.
 
 ### Performance verdict (2026-06-10, updated): HLE shipped ON; gameplay now 33-46 FPS
 
