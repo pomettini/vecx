@@ -500,3 +500,32 @@ Profiling Berzerk gameplay (region split) showed its rooms are NOT pattern-drawn
 
 The **1.3–1.6× generic-lever target is not reachable** with this SDK — the structural reason stands: **the game runs unprivileged (`CONTROL nPRIV=1`)**, so the only fast memory available is the SDK-mapped ~3.6 KB DTCM stack-pool. Tier 1 (relocate `ea_indexed`) and Tier 2a (fuller core) are walled by that pool; ITCM (4× bigger) is forbidden by the sandbox; Tier 2b (wait-skip) is already optimal and regressed when touched.
 **But the HLE lever landed:** with the F410 intercept fixed and enabled, the heavy Mine Storm regime moved from ~28.5 to ~33.4–35.4 FPS and mid-gameplay runs 38–46 FPS. Banked wins: TCM hot core (+15% over the 33.2 baseline), F410 HLE (+17–25% gameplay), FAST_BATCH font fix, render decouple, phosphor flicker fix, audio + ROM picker as features. Possible follow-up if more speed is ever wanted: HLE the remaining hot BIOS draw windows (F4C0 intro draw, F3DD Draw_VL at `f300`) using the same validated recipe.
+
+### Hardware comparison (2026-06-11): Playdate Rev A (F746) vs Rev B (H7)
+
+The original dev device (Rev A) failed its input digitizer and was replaced with a **Rev B**, which uses a different SoC. Re-ran the benchmark suite on the **identical .pdx** (build Jun 11 2026 15:30:21) to compare. Regimes matched by vector count + game state, not just title (idle vs active Mine Storm differ; compared like-for-like). Figures are representative steady-state windows from the on-device 5-second bench log.
+
+**Device identity (from the serial preamble):**
+- Rev A: `target=dvt1`, STM32**F746**, `pcbver=0x01`, code runs from `0x60000000` (PSRAM), ~180 MHz. Serial PDU1-Y024621.
+- Rev B: `target=h7d1`, STM32**H7**, `pcbver=0x13`, code runs from `0x90000000` (QSPI flash), higher clock + bigger cache. Serial PDU4-Y017929.
+
+**Frame rate by game (Rev A → Rev B), same build:**
+
+| Game / regime | Rev A | Rev B | ratio |
+| --- | --- | --- | --- |
+| Mine Storm idle (~90 vec) | 36–37 | 48–49 | 1.34× |
+| Mine Storm heavy (~145 vec) | ~31.5 | 43.7 | 1.39× |
+| Berzerk room | 33.5–37 | 48.5–49.5 | 1.41× |
+| Armor Attack (maze) | 41.5–48 | 49.9 (50 Hz cap) | cap-bound |
+| Rip-Off | ~48 (adaptive-driven) | ~50 (cap) | see pacing |
+| raw throughput @ adaptive floor (12,500) | ~460k cyc/s | ~611k cyc/s | 1.33× |
+| render_fps (complete Vectrex frames/s) | ~14–30 | 20–41 | ~1.5–2× |
+
+**Key findings:**
+- **Rev B is ~1.33–1.41× the raw interpreter throughput of Rev A**, and the ratio *rises with load* (idle 1.33× → heavy MS 1.39× → Berzerk room 1.41×). That upward slope is the signature of a **memory-latency-bound** core meeting a bigger cache: the tighter the game-logic loop, the more of each frame is the interpreter grinding cache misses, exactly where the H7's larger cache pays off.
+- **NOT ~2×.** The H7's much higher clock alone would predict ~2×; the actual ~1.35× confirms the whole-port thesis — the bottleneck is memory latency, not compute, so a faster clock can't help beyond what the extra cache buys. The memory wall from [[project-vecx-perf-plan]] is still the limit, just higher.
+- **The DTCM hot-core relocation survived the SoC change untouched.** All six `itcm D1–D6` probes pass on the H7; the core copies from `0x90000000` flash into DTCM (pool `0x20007c40–0x20008a40`, ~= Rev A's `0x20007bf0`) and runs. The most fragile piece of the port — hand-fitted to Rev A's memory map — needed zero edits. Whatever the H7's unprivileged/pool constraints are, they match Rev A closely enough that nothing broke.
+- **render_fps roughly doubled** — the perceptual win is bigger than the FPS number: far more complete Vectrex frames actually reach the screen (Mine Storm ~14–15 → 18–41). Peak emulated throughput reached **~82% of native 1.5 MHz** on Rev B (6.15M cyc / 5 s window) vs ~60% on Rev A.
+- **The marginal games are now solved:** heavy Mine Storm and Berzerk rooms sit at the 50 Hz display cap; Armor Attack is cap-bound (was compute-bound at 41–48). The three BIOS-draw HLEs (F410/F437/F3DD) fire identically — Armor Attack still HLEs ~11k F437 + ~1.5k F3DD + ~600 F410 strokes/window; the faster core just clears what's left sooner.
+
+**Follow-up surfaced by the data — RETUNE THE ADAPTIVE CONTROLLER FOR REV B.** On Rev B the adaptive cycle budget equilibrates at ~25,000–28,000 and never pins `EMU_CYCLES_NATIVE` (30,000 = true 1.5 MHz pacing), even on sparse Rip-Off. The controller ([playdate_main.c](playdate_main.c) `adaptive_emu_cycles`) was tuned to Rev A: it eases off at ~16–17 ms EMA update time. On Rev B a full 30,000-cycle slice costs ~17 ms — still under the 20 ms / 50 Hz deadline — so widening the grow threshold (or making it device-aware) would let light scenes reach genuine native pacing. Unscheduled; the obvious next experiment if native pacing on Rev B is wanted.
