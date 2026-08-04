@@ -31,23 +31,28 @@ Vectrex has 4 buttons; Playdate has A, B, crank. Chosen approach = both.
 - [ ] Confirm the sensible **default** during testing: A = primary fire (Mine Storm fire is button 4), B = secondary. Current code is A→3 / B→4 — verify and set the good default.
 - [ ] Update `update_input()` in playdate_main.c (linked first → re-check FPS band after).
 
-## 3 — Integrate pd-rom-picker upstream
+## 3 — Integrate pd-rom-picker upstream — CODE DONE, needs device test
 
-Submodule is ~5 commits behind: max ROMs 1024, heap-allocated file list, left/right page scrolling, UTF-8 filenames, robustness fixes.
-- [ ] `git submodule update --remote pd-rom-picker` → upstream main; commit the bump.
-- [ ] Reconcile with `rom_picker_unit.c` + the picker glue in playdate_main.c (heap-allocation + 1024-cap may shift the API — verify compile/link).
+Submodule was ~5 commits behind: max ROMs 1024, heap-allocated file list, left/right page scrolling, UTF-8 filenames, robustness fixes.
+- [x] `git submodule update --remote pd-rom-picker` → `dae3284`. Public API unchanged, so `rom_picker_unit.c` glue needed no edits.
+- [x] **Build fix required:** the new heap-allocated file list is the first thing in the project to call `calloc`/`free`, which exposed a latent LTO bug — the SDK's `setup.c` overrides newlib's allocator hooks (`_malloc_r` → `system->realloc`), but under `-flto` those are slim IR and the plugin drops them (their only consumer, `libc.a`, is not an LTO unit), so the link failed with `undefined reference to _malloc_r`. Fixed in the Makefile with `-Wl,-u,_malloc_r -Wl,-u,_free_r -Wl,-u,_realloc_r`.
 - [ ] Device-test: large ROM folder (page scroll L/R), UTF-8/accented filenames, empty-folder first-run.
 
-## 4 — Performance parity (Rev A + Rev B)
+## 4 — Performance parity (Rev A + Rev B) — CODE DONE, needs device test
 
-- [ ] Retune the adaptive controller so light scenes reach native pacing (`adaptive=30000`) on Rev B **without** regressing Rev A. Path: raise the grow threshold — Rev A self-limits under its deadline while Rev B climbs. See the "retune the adaptive controller" follow-up in [NOTES.md](NOTES.md).
-- [ ] Validate: Rev B full active play (Rip-Off pins ~30000); Rev A idle/boot shows no regression.
+- [x] Retuned the adaptive controller: thresholds `ADAPTIVE_GROW_MS 16` / `ADAPTIVE_SHRINK_MS 18` (were 14/17). One pair, correct on both devices: Rev B's light scenes can now climb to `EMU_CYCLES_NATIVE`; Rev A's heavy scenes run 26–30 ms — far above SHRINK — so they stay pinned at the floor exactly as before.
+- [ ] Validate: Rev B full active play (Rip-Off should reach `adaptive=30000`); Rev A idle/boot shows no regression.
 - [ ] Add the both-devices validation rule + load-bearing caveats to a `CLAUDE.md` (create it) so it survives future sessions.
 
-## 5 — Settings persistence (the "Saves" analog)
+## 4b — Auto frameskip — CODE DONE, needs device test
 
-Vectrex games don't save; preferences should.
-- [ ] Persist Rotation / Frameskip / Sound / last-played ROM to the data folder; restore on launch.
+- [x] Frameskip menu is now **`Auto` / `0` / `1`**, defaulting to Auto (FamiCrank parity). Auto rides the same smoothed update-time signal as the adaptive controller: it engages at ≥19 ms and releases at ≤16 ms (hysteresis). Rationale: once we miss the 50 Hz deadline the display frame is dropped anyway, so drawing every Vectrex frame only steals time from emulation.
+- [ ] Watch for interaction with the adaptive controller (skip lowers update time → controller may grow the budget → equilibrium). Confirm it settles rather than oscillating visibly.
+
+## 5 — Settings persistence — CODE DONE, needs device test
+
+- [x] Rotation / Frameskip / Sound / last-played ROM persist to `settings.cfg` in the data folder; restored before the menu is built so items come up with stored values. Written on every menu change (system menu is open, so no gameplay stall) and on ROM select. Corrupt/unknown keys degrade to defaults (every setter range-checks).
+- [x] Last-played ROM auto-resumes at launch **only if the file still exists**; otherwise boots to the picker. The picker stays one menu item away.
 - [ ] Reconsider the **Sound default** — currently OFF (a Rev A CPU-saver); Rev B has headroom. Decide default; keep the menu toggle either way.
 
 ## 6 — BIOS: bundle it (decision made)

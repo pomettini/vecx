@@ -1,5 +1,7 @@
-name=vecx
+name=CrankTrex
 author=Pomettini & Valavan Manohararajah
 description=Vectrex emulator for Playdate
 bundleID=com.pomettini.vecx
-imagePath=
+version=0.2
+buildNumber=1
+imagePath=SystemAssets/

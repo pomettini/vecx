@@ -24,11 +24,25 @@ void render_refresh_menu(void);
  */
 uint32_t render_draw_frame(void);
 
-/* menu-selected frameskip: 0 = render every frame, N = skip N frames between renders. */
+/* menu-selected frameskip: 0 = render every frame, N = skip N frames between
+ * renders, and -1 = "Auto" -- the host decides per frame (it skips only while
+ * the update loop is missing the 50 Hz deadline; see osint_render). */
 int render_frame_skip(void);
 
 /* menu-selected screen rotation in degrees: -90, 0 or 90. Input mapping uses it
  * to counter-rotate the d-pad so directions stay screen-relative. */
 int render_rotation(void);
+
+/* Persisted settings, as raw menu indices (rotation 0..2 = -90/0/90; frameskip
+ * 0..2 = Auto/0/1). The host writes these to the data folder and restores them
+ * at boot. Setters are safe to call before render_refresh_menu(). */
+int render_get_rotation_index(void);
+void render_set_rotation_index(int index);
+int render_get_frameskip_index(void);
+void render_set_frameskip_index(int index);
+
+/* Called whenever one of the renderer's own menu items changes, so the host can
+ * persist the new value. Register before the menu is built. */
+void render_set_on_settings_changed(void (*callback)(void));
 
 #endif /* RENDER_H */

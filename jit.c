@@ -208,7 +208,7 @@ static void jit_m3_benchmark(PlaydateAPI *pd)
 		memcmp(ci.mem, cj.mem, sizeof(ci.mem)) == 0);
 
 	pd->system->logToConsole(
-		"vecx jit: M3 verify interp(a=%02x b=%02x cc=%02x) jit(a=%02x b=%02x cc=%02x) %s (%u hw)",
+		"cranktrex jit: M3 verify interp(a=%02x b=%02x cc=%02x) jit(a=%02x b=%02x cc=%02x) %s (%u hw)",
 		ci.a, ci.b, ci.cc, cj.a, cj.b, cj.cc, ok ? "OK" : "MISMATCH", b.len);
 
 	if (!ok)
@@ -228,7 +228,7 @@ static void jit_m3_benchmark(PlaydateAPI *pd)
 		uint32_t ratio_x100 = jit_ms ? (interp_ms * 100u) / jit_ms : 0u;
 
 		pd->system->logToConsole(
-			"vecx jit: M3 bench K=%u interp=%ums jit=%ums speedup=%u.%02ux (both PSRAM)",
+			"cranktrex jit: M3 bench K=%u interp=%ums jit=%ums speedup=%u.%02ux (both PSRAM)",
 			K, (unsigned)interp_ms, (unsigned)jit_ms,
 			(unsigned)(ratio_x100 / 100u), (unsigned)(ratio_x100 % 100u));
 	}
@@ -263,7 +263,7 @@ static void jit_m5_dtcm(PlaydateAPI *pd)
 	ok = (ci.a == cj.a && ci.b == cj.b && ci.cc == cj.cc &&
 		memcmp(ci.mem, cj.mem, sizeof(ci.mem)) == 0);
 
-	pd->system->logToConsole("vecx jit: M5 DTCM block at %p verify %s",
+	pd->system->logToConsole("cranktrex jit: M5 DTCM block at %p verify %s",
 		(void *)dtcm_code, ok ? "OK" : "BAD");
 	if (!ok)
 		return;
@@ -281,7 +281,7 @@ static void jit_m5_dtcm(PlaydateAPI *pd)
 		uint32_t rx = jm ? (im * 100u) / jm : 0u;
 
 		pd->system->logToConsole(
-			"vecx jit: M5 DTCM bench K=%u interp(PSRAM)=%ums jit(DTCM)=%ums speedup=%u.%02ux (cf jit-PSRAM was 95ms)",
+			"cranktrex jit: M5 DTCM bench K=%u interp(PSRAM)=%ums jit(DTCM)=%ums speedup=%u.%02ux (cf jit-PSRAM was 95ms)",
 			K, (unsigned)im, (unsigned)jm, (unsigned)(rx / 100u), (unsigned)(rx % 100u));
 	}
 }
@@ -390,7 +390,7 @@ static void jit_m4_addflags(PlaydateAPI *pd)
 		}
 	}
 
-	pd->system->logToConsole("vecx jit: M4 ADDB full-flags %u/%u match %s",
+	pd->system->logToConsole("cranktrex jit: M4 ADDB full-flags %u/%u match %s",
 		tested - fails, tested, fails == 0 ? "ALL OK" : "FAILS!");
 }
 
@@ -496,7 +496,7 @@ static void jit_m6_realmem(PlaydateAPI *pd)
 	ok = (ci.a == cj.a && ci.cc == cj.cc);
 
 	pd->system->logToConsole(
-		"vecx jit: M6 realmem verify interp(a=%02x cc=%02x) jit(a=%02x cc=%02x) %s (%u hw)",
+		"cranktrex jit: M6 realmem verify interp(a=%02x cc=%02x) jit(a=%02x cc=%02x) %s (%u hw)",
 		ci.a, ci.cc, cj.a, cj.cc, ok ? "OK" : "MISMATCH", b.len);
 	if (!ok)
 		return;
@@ -514,7 +514,7 @@ static void jit_m6_realmem(PlaydateAPI *pd)
 		uint32_t rx = jm ? (im * 100u) / jm : 0u;
 
 		pd->system->logToConsole(
-			"vecx jit: M6 realmem K=%u interp=%ums jit=%ums speedup=%u.%02ux (real vecx_read8/write8)",
+			"cranktrex jit: M6 realmem K=%u interp=%ums jit=%ums speedup=%u.%02ux (real vecx_read8/write8)",
 			K, (unsigned)im, (unsigned)jm, (unsigned)(rx / 100u), (unsigned)(rx % 100u));
 	}
 }
@@ -532,7 +532,7 @@ void jit_selftest(PlaydateAPI *pd)
 	{
 		unsigned (*fn)(void) = (unsigned (*)(void))jit_finalize(pd, &b);
 		unsigned r = fn();
-		pd->system->logToConsole("vecx jit: M1 return-0x42 -> 0x%x %s", r, r == 0x42u ? "OK" : "WRONG");
+		pd->system->logToConsole("cranktrex jit: M1 return-0x42 -> 0x%x %s", r, r == 0x42u ? "OK" : "WRONG");
 	}
 
 	/* M2 */
@@ -548,7 +548,7 @@ void jit_selftest(PlaydateAPI *pd)
 		volatile uint8_t v = 0x10u;
 		inc((uint8_t *)&v);
 		inc((uint8_t *)&v);
-		pd->system->logToConsole("vecx jit: M2 inc x2 (0x10) -> 0x%x %s", (unsigned)v, v == 0x12u ? "OK" : "WRONG");
+		pd->system->logToConsole("cranktrex jit: M2 inc x2 (0x10) -> 0x%x %s", (unsigned)v, v == 0x12u ? "OK" : "WRONG");
 	}
 
 	/* M3 */

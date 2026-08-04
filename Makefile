@@ -1,7 +1,10 @@
 HEAP_SIZE  = 8388208
 STACK_SIZE = 61800
 
-PRODUCT = vecx.pdx
+# NB: bundleID in Source/pdxinfo stays com.pomettini.vecx on purpose -- it keys
+# the on-device data folder (settings.cfg), so changing it would orphan existing
+# installs. Only the .pdx filename carries the CrankTrex name.
+PRODUCT = CrankTrex.pdx
 
 # Locate the SDK.
 SDK = ${PLAYDATE_SDK_PATH}
@@ -36,6 +39,14 @@ include $(SDK)/C_API/buildsupport/common.mk
 OPT = -O3 -falign-functions=32 -fomit-frame-pointer
 CPFLAGS += -flto
 LDFLAGS += -flto
+
+# The SDK's setup.c overrides newlib's allocator hooks (_malloc_r etc -> the
+# Playdate's system->realloc). Under -flto those overrides are compiled to slim
+# IR and the plugin DROPS them: their only consumer is newlib's libc.a, which is
+# not an LTO unit, so LTO sees them as unreferenced. The link then fails with
+# "undefined reference to _malloc_r" as soon as anything heap-allocates (the
+# pd-rom-picker file list does). -u forces the linker to keep them.
+LDFLAGS += -Wl,-u,_malloc_r -Wl,-u,_free_r -Wl,-u,_realloc_r
 
 # build 92: .itcm section for runtime relocation of the hot core into fast TCM.
 override LDSCRIPT = ./link_map.ld

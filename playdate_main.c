@@ -1,4 +1,6 @@
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "pd_api.h"
@@ -18,7 +20,24 @@
  * = TRUE native pacing at 50 Hz; back off fast when the game gets heavy. Heavy
  * regimes sit at the old floor (12,500) and behave exactly as before. */
 #define EMU_CYCLES_NATIVE ((long)(VECTREX_MHZ / VECTREX_RENDER_HZ))
+/* Controller thresholds on the SMOOTHED update time. The 50 Hz callback gives a
+ * 20 ms deadline; grow while the average stays at/under GROW_MS, back off once
+ * it reaches SHRINK_MS, so equilibrium sits ~3 ms clear of an overrun.
+ * RETUNED 2026-06-11 for Rev B: the previous 14/17 pair was fitted to Rev A and
+ * parked the H7 at ~25-28k cycles -- ~15% short of native -- because Rev B's
+ * light scenes land inside the old dead zone and stop growing. Raising the pair
+ * lets the faster device climb to EMU_CYCLES_NATIVE, while Rev A self-limits:
+ * its heavy scenes run 26-30 ms, far above SHRINK_MS, so they stay pinned at the
+ * floor exactly as before (no regression), and its light scenes simply gain a
+ * little more headroom. One threshold pair, correct on both devices. */
+#define ADAPTIVE_GROW_MS   16
+#define ADAPTIVE_SHRINK_MS 18
+/* "Auto" frameskip band, on the same smoothed signal (engage above the 50 Hz
+ * deadline, release well below it so it doesn't flap). */
+#define AUTOSKIP_ENGAGE_MS  19
+#define AUTOSKIP_RELEASE_MS 16
 static long adaptive_emu_cycles = EMU_CYCLES_PER_UPDATE;
+static int auto_skip_active;
 /* EMA of update time (x16 fixed point). Controlling on the raw per-update time
  * stalled near the floor: isolated 20-30 ms spikes (frame flips, logging) kept
  * tripping the fast back-off while the average sat at 9-13 ms. */
@@ -29,7 +48,7 @@ static long adaptive_ema_ms_x16;
  * sets the 38.2-FPS packing. The compile-time in BUILD_LABEL already
  * distinguishes builds. (11 chars == the layout that measured 38.2.)
  */
-#define BUILD_VARIANT "vecx-render"
+#define BUILD_VARIANT "ctrx-render"
 /* Bytes below the init stack frame for the relocated hot-core pool TOP. The pool
  * extends DOWN by the core size and must land in the safe gap between resident
  * firmware data (floor) and the live stack (ceiling). 0x1180 keeps the top at
@@ -221,9 +240,9 @@ static void load_cart(const char* path)
 	n = read_partial_file(path, cart, sizeof(cart));
 
 	if (n > 0)
-		pd->system->logToConsole("vecx: loaded cart %s (%u bytes)", path, n);
+		pd->system->logToConsole("cranktrex: loaded cart %s (%u bytes)", path, n);
 	else
-		pd->system->logToConsole("vecx: FAILED to load cart %s", path);
+		pd->system->logToConsole("cranktrex: FAILED to load cart %s", path);
 }
 
 static void update_input(void)
@@ -320,7 +339,7 @@ static void log_sample_profile(void)
 		sample_insert_top(vecx_sample_pc_addr[i], vecx_sample_pc_count[i], pc_values, pc_counts);
 
 	pd->system->logToConsole(
-		"vecx sample build=\"%s\" samples=%lu ops=%02x:%lu,%02x:%lu,%02x:%lu,%02x:%lu,%02x:%lu pcs=%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu",
+		"cranktrex sample build=\"%s\" samples=%lu ops=%02x:%lu,%02x:%lu,%02x:%lu,%02x:%lu,%02x:%lu pcs=%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu",
 		BUILD_LABEL,
 		vecx_sample_total,
 		op_values[0],
@@ -360,7 +379,7 @@ static void log_sample_profile(void)
 				bk_values, bk_counts);
 
 		pd->system->logToConsole(
-			"vecx region samples=%lu cart=%lu(%lu%%) ram=%lu bios=%lu(%lu%%) other=%lu | bios_top=%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu",
+			"cranktrex region samples=%lu cart=%lu(%lu%%) ram=%lu bios=%lu(%lu%%) other=%lu | bios_top=%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu,%04x:%lu",
 			vecx_sample_total,
 			rcart, (rcart * 100ul) / tot,
 			rram,
@@ -384,17 +403,17 @@ static void log_hle_capture(void)
 
 	if (vecx_hle_vl_exec_calls != 0 || vecx_hle_vl_exec_declines != 0)
 		pd->system->logToConsole(
-			"vecx hle-vl-active: HLE'd %lu F3DD strokes, declined=%lu",
+			"cranktrex hle-vl-active: HLE'd %lu F3DD strokes, declined=%lu",
 			vecx_hle_vl_exec_calls, vecx_hle_vl_exec_declines);
 
 	if (vecx_hle_vl_calls != 0) {
 		pd->system->logToConsole(
-			"vecx hle-vl: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu (F3DD shadow)",
+			"cranktrex hle-vl: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu (F3DD shadow)",
 			vecx_hle_vl_calls, vecx_hle_vl_ok,
 			vecx_hle_vl_cntmiss, vecx_hle_vl_geommiss);
 		if (vecx_hle_vl_mm_valid)
 			pd->system->logToConsole(
-				"vecx hle-vl-MISMATCH: scale=%u nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
+				"cranktrex hle-vl-MISMATCH: scale=%u nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
 				vecx_hle_vl_mm_scale, vecx_hle_vl_mm_nreal,
 				vecx_hle_vl_mm_p[0], vecx_hle_vl_mm_p[1],
 				vecx_hle_vl_mm_p[2], vecx_hle_vl_mm_p[3],
@@ -404,17 +423,17 @@ static void log_hle_capture(void)
 
 	if (vecx_hle_pat_exec_calls != 0 || vecx_hle_pat_exec_declines != 0)
 		pd->system->logToConsole(
-			"vecx hle-pat-active: HLE'd %lu F437 strokes, declined=%lu",
+			"cranktrex hle-pat-active: HLE'd %lu F437 strokes, declined=%lu",
 			vecx_hle_pat_exec_calls, vecx_hle_pat_exec_declines);
 
 	if (vecx_hle_pat_calls != 0) {
 		pd->system->logToConsole(
-			"vecx hle-pat: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu (F437 shadow)",
+			"cranktrex hle-pat: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu (F437 shadow)",
 			vecx_hle_pat_calls, vecx_hle_pat_ok,
 			vecx_hle_pat_cntmiss, vecx_hle_pat_geommiss);
 		if (vecx_hle_pat_mm_valid)
 			pd->system->logToConsole(
-				"vecx hle-pat-MISMATCH: pat=%02x scale=%u i=%ld npred=%ld nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
+				"cranktrex hle-pat-MISMATCH: pat=%02x scale=%u i=%ld npred=%ld nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
 				vecx_hle_pat_mm_pat, vecx_hle_pat_mm_scale,
 				vecx_hle_pat_mm_idx, vecx_hle_pat_mm_npred, vecx_hle_pat_mm_nreal,
 				vecx_hle_pat_mm_p[0], vecx_hle_pat_mm_p[1],
@@ -425,7 +444,7 @@ static void log_hle_capture(void)
 
 	if (vecx_hle_exec_calls != 0 || vecx_hle_declines != 0) {
 		pd->system->logToConsole(
-			"vecx hle-active: HLE'd %lu F410 calls, declined=%lu max_scale=%lu max_ent=%lu (enabled=%d)",
+			"cranktrex hle-active: HLE'd %lu F410 calls, declined=%lu max_scale=%lu max_ent=%lu (enabled=%d)",
 			vecx_hle_exec_calls, vecx_hle_declines, vecx_hle_max_scale,
 			vecx_hle_max_ent, vecx_hle_enabled);
 		return;
@@ -435,19 +454,19 @@ static void log_hle_capture(void)
 		return;
 
 	pd->system->logToConsole(
-		"vecx hle: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu avg_vec=%lu (F410 shadow-validate)",
+		"cranktrex hle: calls=%lu OK=%lu cntmiss=%lu geommiss=%lu avg_vec=%lu (F410 shadow-validate)",
 		vecx_hle_calls, vecx_hle_ok, vecx_hle_cntmiss, vecx_hle_geommiss,
 		vecx_hle_tot_vec / c);
 
 	if (vecx_hle_mm_valid)
 		pd->system->logToConsole(
-			"vecx hle-MISMATCH: i=%ld npred=%ld nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
+			"cranktrex hle-MISMATCH: i=%ld npred=%ld nreal=%ld pred=(%ld,%ld)->(%ld,%ld) real=(%ld,%ld)->(%ld,%ld)",
 			vecx_hle_mm_idx, vecx_hle_mm_npred, vecx_hle_mm_nreal,
 			vecx_hle_mm_p[0], vecx_hle_mm_p[1], vecx_hle_mm_p[2], vecx_hle_mm_p[3],
 			vecx_hle_mm_r[0], vecx_hle_mm_r[1], vecx_hle_mm_r[2], vecx_hle_mm_r[3]);
 	else if (vecx_hle_s_valid)
 		pd->system->logToConsole(
-			"vecx hle-sample: scale=%u vec=%ld listX=%04x list=%02x,%02x,%02x,%02x,%02x,%02x start=(%ld,%ld) v0=(%ld,%ld)->(%ld,%ld) v1=(%ld,%ld)->(%ld,%ld)",
+			"cranktrex hle-sample: scale=%u vec=%ld listX=%04x list=%02x,%02x,%02x,%02x,%02x,%02x start=(%ld,%ld) v0=(%ld,%ld)->(%ld,%ld) v1=(%ld,%ld)->(%ld,%ld)",
 			vecx_hle_s_count, vecx_hle_s_vec, vecx_hle_s_listx,
 			vecx_hle_s_list[0], vecx_hle_s_list[1], vecx_hle_s_list[2],
 			vecx_hle_s_list[3], vecx_hle_s_list[4], vecx_hle_s_list[5],
@@ -515,7 +534,7 @@ static void maybe_log_benchmark(uint32_t now_ms)
 		: 0;
 
 	pd->system->logToConsole(
-		"vecx bench build=\"%s\" window_ms=%lu updates=%lu renders=%lu avg_fps=%lu.%02lu avg_render_fps=%lu.%02lu avg_update_ms=%lu.%02lu avg_render_ms=%lu.%02lu min_update_ms=%lu max_update_ms=%lu emu_cycles=%lu emu_instr=%lu avg_instr_update=%lu.%02lu avg_cpi=%lu.%02lu avg_vectors=%lu.%02lu wait_skips=%lu wait_skip_cycles=%lu delay_skips=%lu delay_skip_cycles=%lu skipped=%lu adaptive=%ld",
+		"cranktrex bench build=\"%s\" window_ms=%lu updates=%lu renders=%lu avg_fps=%lu.%02lu avg_render_fps=%lu.%02lu avg_update_ms=%lu.%02lu avg_render_ms=%lu.%02lu min_update_ms=%lu max_update_ms=%lu emu_cycles=%lu emu_instr=%lu avg_instr_update=%lu.%02lu avg_cpi=%lu.%02lu avg_vectors=%lu.%02lu wait_skips=%lu wait_skip_cycles=%lu delay_skips=%lu delay_skip_cycles=%lu skipped=%lu adaptive=%ld",
 		BUILD_LABEL,
 		(unsigned long)elapsed_ms,
 		(unsigned long)bench_update_count,
@@ -546,7 +565,7 @@ static void maybe_log_benchmark(uint32_t now_ms)
 		adaptive_emu_cycles);
 
 	pd->system->logToConsole(
-		"vecx snd: callbacks=%u underruns=%u ringfill=%u ratio=%d maxvol=%d volA=%u volB=%u volC=%u enable=0x%02x",
+		"cranktrex snd: callbacks=%u underruns=%u ringfill=%u ratio=%d maxvol=%d volA=%u volB=%u volC=%u enable=0x%02x",
 		e8910_dbg_calls, e8910_dbg_active, e8910_ring_fill(), e8910_dbg_ratio_x1000, e8910_dbg_maxvol,
 		snd_regs[8], snd_regs[9], snd_regs[10], snd_regs[7]);
 	e8910_dbg_maxvol = 0;
@@ -563,6 +582,9 @@ void osint_render(void)
 	uint32_t start_ms = pd->system->getCurrentTimeMilliseconds();
 	uint32_t drawn_vectors;
 	int skip = render_frame_skip();
+
+	if (skip < 0)
+		skip = auto_skip_active; /* "Auto": driven by the update-time EMA */
 
 	if (skip > 0) {
 		render_skip_phase++;
@@ -615,41 +637,41 @@ static void itcm_relocate(void)
 	uint32_t i;
 
 	pd->system->logToConsole(
-		"vecx itcm: A src=%p dst=%p size=%u hotcore=%p", (void*)__itcm_start,
+		"cranktrex itcm: A src=%p dst=%p size=%u hotcore=%p", (void*)__itcm_start,
 		(void*)pool, (unsigned)size, (void*)e6809_hotcore);
 	itcm_drain();
 
 	for (i = 0; i < words; i++)
 		dst[i] = src[i];
-	pd->system->logToConsole("vecx itcm: B copy done (%u words)", words);
+	pd->system->logToConsole("cranktrex itcm: B copy done (%u words)", words);
 	itcm_drain();
 
 	pd->system->clearICache();
 	e6809_hotcore_p = (unsigned (*)(unsigned, unsigned))((pool + off) | 1u);
 	pd->system->logToConsole(
-		"vecx itcm: C hotcore relocated %p -> %p", (void*)e6809_hotcore,
+		"cranktrex itcm: C hotcore relocated %p -> %p", (void*)e6809_hotcore,
 		(void*)e6809_hotcore_p);
 	itcm_drain();
 
 	{
 		unsigned r = e6809_hotcore_p (0xabcdu, 0);
-		pd->system->logToConsole("vecx itcm: D1 entry=0x%x %s (pool %p-%p)",
+		pd->system->logToConsole("cranktrex itcm: D1 entry=0x%x %s (pool %p-%p)",
 			r, r == 0x42u ? "EXEC-OK" : "BAD", (void*)pool, (void*)(pool + size));
 		itcm_drain();
 		r = e6809_hotcore_p (0xabceu, 0);
-		pd->system->logToConsole("vecx itcm: D2 ea_indexed call=0x%x (ok>=0x100)", r);
+		pd->system->logToConsole("cranktrex itcm: D2 ea_indexed call=0x%x (ok>=0x100)", r);
 		itcm_drain();
 		r = e6809_hotcore_p (0xabcfu, 0);
-		pd->system->logToConsole("vecx itcm: D3 write8 call=0x%x (ok=0x2a5)", r);
+		pd->system->logToConsole("cranktrex itcm: D3 write8 call=0x%x (ok=0x2a5)", r);
 		itcm_drain();
 		r = e6809_hotcore_p (0xabd0u, 0);
-		pd->system->logToConsole("vecx itcm: D4 inst_sub8 call=0x%x (ok=0x340)", r);
+		pd->system->logToConsole("cranktrex itcm: D4 inst_sub8 call=0x%x (ok=0x340)", r);
 		itcm_drain();
 		r = e6809_hotcore_p (0xabd1u, 0);
-		pd->system->logToConsole("vecx itcm: D5 read8(VIA) call=0x%x (ok>=0x400)", r);
+		pd->system->logToConsole("cranktrex itcm: D5 read8(VIA) call=0x%x (ok>=0x400)", r);
 		itcm_drain();
 		r = e6809_hotcore_p (0xabd2u, 0);
-		pd->system->logToConsole("vecx itcm: D6 write8(VIA) call=0x%x (ok=0x500)", r);
+		pd->system->logToConsole("cranktrex itcm: D6 write8(VIA) call=0x%x (ok=0x500)", r);
 		itcm_drain();
 	}
 #endif
@@ -696,10 +718,78 @@ static void rompicker_menu_cb(void* userdata)
 static int sound_enabled;
 static PDMenuItem* sound_item;
 
+/* ---- persisted settings --------------------------------------------------
+ * Rotation, Frameskip, Sound and the last-played ROM live in a small text file
+ * in the game's data folder, so the emulator comes back the way it was left.
+ * Saved whenever a menu item changes (the system menu is open at that moment,
+ * so the flash write never stalls gameplay) and when a ROM is chosen. */
+#define SETTINGS_FILE "settings.cfg"
+
+static void settings_save(void)
+{
+	SDFile* file = pd->file->open(SETTINGS_FILE, kFileWrite);
+	char buf[ROM_PICKER_MAX_PATH + 96];
+	int n;
+
+	if (file == NULL)
+		return;
+
+	n = snprintf(buf, sizeof(buf), "rotation=%d\nframeskip=%d\nsound=%d\nrom=%s\n",
+		render_get_rotation_index(), render_get_frameskip_index(),
+		sound_enabled, selected_rom);
+
+	if (n > 0)
+		pd->file->write(file, buf, (unsigned int)n);
+	pd->file->close(file);
+}
+
+/* Restore into the live state. Called before the menu is built so the items
+ * come up showing the stored values. Unknown/garbage keys are ignored, and each
+ * setter range-checks, so a corrupt file degrades to defaults rather than
+ * misbehaving. */
+static void settings_load(void)
+{
+	char buf[ROM_PICKER_MAX_PATH + 96];
+	unsigned int n = read_partial_file(SETTINGS_FILE, (unsigned char*)buf, sizeof(buf) - 1);
+	char* line = buf;
+
+	if (n == 0)
+		return;
+	buf[n] = '\0';
+
+	while (line != NULL && *line != '\0') {
+		char* next = strchr(line, '\n');
+
+		if (next != NULL)
+			*next++ = '\0';
+
+		if (strncmp(line, "rotation=", 9) == 0)
+			render_set_rotation_index(atoi(line + 9));
+		else if (strncmp(line, "frameskip=", 10) == 0)
+			render_set_frameskip_index(atoi(line + 10));
+		else if (strncmp(line, "sound=", 6) == 0)
+			sound_enabled = atoi(line + 6) != 0;
+		else if (strncmp(line, "rom=", 4) == 0 && line[4] != '\0') {
+			/* Only resume a ROM that is still on the card; otherwise fall
+			 * through to the picker instead of failing to load. */
+			SDFile* rom = pd->file->open(line + 4, kFileRead);
+
+			if (rom != NULL) {
+				pd->file->close(rom);
+				strncpy(selected_rom, line + 4, sizeof(selected_rom) - 1);
+				selected_rom[sizeof(selected_rom) - 1] = '\0';
+			}
+		}
+
+		line = next;
+	}
+}
+
 static void sound_menu_cb(void* userdata)
 {
 	(void)userdata;
 	sound_enabled = pd->system->getMenuItemValue(sound_item);
+	settings_save();
 }
 
 static void rebuild_menu(int in_picker)
@@ -728,6 +818,7 @@ static void start_emulation(void)
 	want_picker = 0;
 	picker_active = 0;
 	rebuild_menu(0); /* gameplay: "ROM Picker" slot */
+	settings_save(); /* remember this cart for the next launch */
 }
 
 /* back to the picker: wipe the machine's memory + reset everything, restore the
@@ -804,11 +895,20 @@ static int update(void* userdata)
 	{
 		long ema_ms = adaptive_ema_ms_x16 / 16;
 
-		if (ema_ms <= 14 && adaptive_emu_cycles < EMU_CYCLES_NATIVE) {
+		/* "Auto" frameskip rides the same smoothed signal: once we are past the
+		 * 50 Hz deadline the display frame is dropped regardless, so drawing
+		 * every Vectrex frame only steals time from emulation. Hysteresis
+		 * (engage high, release lower) keeps it from flapping frame to frame. */
+		if (ema_ms >= AUTOSKIP_ENGAGE_MS)
+			auto_skip_active = 1;
+		else if (ema_ms <= AUTOSKIP_RELEASE_MS)
+			auto_skip_active = 0;
+
+		if (ema_ms <= ADAPTIVE_GROW_MS && adaptive_emu_cycles < EMU_CYCLES_NATIVE) {
 			adaptive_emu_cycles += 1000;
 			if (adaptive_emu_cycles > EMU_CYCLES_NATIVE)
 				adaptive_emu_cycles = EMU_CYCLES_NATIVE;
-		} else if (ema_ms >= 17 && adaptive_emu_cycles > EMU_CYCLES_PER_UPDATE) {
+		} else if (ema_ms >= ADAPTIVE_SHRINK_MS && adaptive_emu_cycles > EMU_CYCLES_PER_UPDATE) {
 			adaptive_emu_cycles -= 1000;
 			if (adaptive_emu_cycles < EMU_CYCLES_PER_UPDATE)
 				adaptive_emu_cycles = EMU_CYCLES_PER_UPDATE;
@@ -846,10 +946,17 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		e8910_init_sound(pd);
 		itcm_relocate();
 
+		/* Restore before the menu is built so the items show stored values.
+		 * If a still-present last-played ROM was recorded, selected_rom is set
+		 * and update() launches straight into it (the picker is one menu item
+		 * away); otherwise we boot into the picker as usual. */
+		render_set_on_settings_changed(settings_save);
+		settings_load();
+
 		init_rom_picker();
 		rebuild_menu(1); /* boot into the picker: "Sound" + Rotation + Frameskip */
 
-		pd->system->logToConsole("vecx: Playdate C build %s", BUILD_LABEL);
+		pd->system->logToConsole("cranktrex: Playdate C build %s", BUILD_LABEL);
 		pd->system->setUpdateCallback(update, pd);
 	} else if (event == kEventTerminate) {
 		e8910_done_sound();

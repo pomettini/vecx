@@ -150,6 +150,20 @@ static void save_persistence_frame(void)
 }
 #endif
 
+/* Invoked when Rotation/Frameskip change so the host can persist them. */
+static void (*settings_changed_cb)(void);
+
+void render_set_on_settings_changed(void (*callback)(void))
+{
+	settings_changed_cb = callback;
+}
+
+static void settings_changed(void)
+{
+	if (settings_changed_cb != NULL)
+		settings_changed_cb();
+}
+
 static PDMenuItem *rotation_item;
 static const char *rotation_options[] = { "-90", "0", "90" };
 
@@ -158,27 +172,61 @@ static void rotation_menu_callback(void *userdata)
 	(void)userdata;
 	rotation = pd->system->getMenuItemValue(rotation_item);
 	update_scaling();
+	settings_changed();
 }
 
-/* render every (frame_skip + 1)th frame; the rest are skipped. Selected via menu. */
+/* Render every (frame_skip + 1)th frame; the rest are skipped.
+ * Index 0 is "Auto": rather than a fixed cadence, the host skips only while the
+ * update loop is missing the 50 Hz deadline -- at that point the display frame
+ * is dropped anyway, so drawing every Vectrex frame is wasted work and the
+ * cycles are better spent on emulation. Indices 1..N are the fixed skips. */
+enum { FRAMESKIP_AUTO = 0 };
 static PDMenuItem *frameskip_item;
-static const char *frameskip_options[] = { "0", "1" };
-static int frame_skip;
+static const char *frameskip_options[] = { "Auto", "0", "1" };
+static int frameskip_index = FRAMESKIP_AUTO;
 
 static void frameskip_menu_callback(void *userdata)
 {
 	(void)userdata;
-	frame_skip = pd->system->getMenuItemValue(frameskip_item);
+	frameskip_index = pd->system->getMenuItemValue(frameskip_item);
+	settings_changed();
 }
 
 int render_frame_skip(void)
 {
-	return frame_skip;
+	return frameskip_index == FRAMESKIP_AUTO ? -1 : frameskip_index - 1;
 }
 
 int render_rotation(void)
 {
 	return rotation == ROT_LEFT ? -90 : rotation == ROT_RIGHT ? 90 : 0;
+}
+
+int render_get_rotation_index(void)
+{
+	return rotation;
+}
+
+void render_set_rotation_index(int index)
+{
+	if (index < ROT_LEFT || index > ROT_RIGHT)
+		return;
+	rotation = index;
+	update_scaling();
+}
+
+int render_get_frameskip_index(void)
+{
+	return frameskip_index;
+}
+
+void render_set_frameskip_index(int index)
+{
+	int count = (int)(sizeof(frameskip_options) / sizeof(frameskip_options[0]));
+
+	if (index < 0 || index >= count)
+		return;
+	frameskip_index = index;
 }
 
 void render_init(PlaydateAPI *playdate, int screen_width, int screen_height)
@@ -205,7 +253,7 @@ void render_refresh_menu(void)
 		"Frameskip", frameskip_options,
 		(int)(sizeof(frameskip_options) / sizeof(frameskip_options[0])),
 		frameskip_menu_callback, NULL);
-	pd->system->setMenuItemValue(frameskip_item, frame_skip);
+	pd->system->setMenuItemValue(frameskip_item, frameskip_index);
 }
 
 uint32_t render_draw_frame(void)
